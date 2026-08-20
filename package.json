@@ -12,7 +12,7 @@
     "dev:server:watchdog": "node scripts/relay-watchdog.mjs",
     "dev:server": "pnpm --filter codex-relay dev",
     "codex-relay": "node scripts/relay-watchdog.mjs",
-    "codex-relay:cli": "NODE_ENV=development pnpm --filter codex-relay exec tsx src/cli.ts",
+    "codex-relay:cli": "CODEX_RELAY_APNS_ENV_PATH=\"$PWD/.codex-relay/apns.env\" NODE_ENV=development pnpm --filter codex-relay exec tsx src/cli.ts",
     "relay:approve": "pnpm codex-relay:cli approve",
     "relay:bg": "pnpm codex-relay:cli --shared-app-server --bg",
     "relay:qr": "pnpm codex-relay:cli qr",
