@@ -703,6 +703,25 @@ export const ListThreadsResponseSchema = z.object({
   source: z.enum(["app-server", "memory"]).default("memory"),
 });
 
+export const HostSyncStreamRequestSchema = z.object({}).strict();
+
+const HostSyncEventBaseSchema = z.object({
+  revision: z.number().int().nonnegative(),
+  occurredAt: IsoDateTimeSchema,
+});
+
+export const HostSyncEventSchema = z.discriminatedUnion("type", [
+  HostSyncEventBaseSchema.extend({
+    type: z.literal("sync.required"),
+    reason: z.enum(["connected", "upstream-reconnected"]),
+  }),
+  HostSyncEventBaseSchema.extend({
+    type: z.literal("thread.changed"),
+    threadId: z.string().min(1),
+    change: z.enum(["upserted", "activity", "removed"]),
+  }),
+]);
+
 export const ArchiveThreadResponseSchema = z.object({
   archivedThreadId: z.string().min(1),
   threads: z.array(ThreadSummarySchema),
@@ -1094,6 +1113,8 @@ export type ThreadDetailResponse = z.infer<typeof ThreadDetailResponseSchema>;
 export type ThreadMessageDetailField = z.infer<typeof ThreadMessageDetailFieldSchema>;
 export type ThreadMessageDetailResponse = z.infer<typeof ThreadMessageDetailResponseSchema>;
 export type StreamThreadRunEvent = z.infer<typeof StreamThreadRunEventSchema>;
+export type HostSyncStreamRequest = z.infer<typeof HostSyncStreamRequestSchema>;
+export type HostSyncEvent = z.infer<typeof HostSyncEventSchema>;
 export type UpdateWorkspaceFileContentRequest = z.infer<
   typeof UpdateWorkspaceFileContentRequestSchema
 >;
@@ -1107,6 +1128,7 @@ export const apiPaths = {
   session: "/v1/session",
   sessionRefresh: "/v1/session/refresh",
   status: "/v1/status",
+  hostSyncStream: "/v1/sync/stream",
   preferences: "/v1/preferences",
   pushNotifications: "/v1/notifications/push",
   pushNotificationsTest: "/v1/notifications/push/test",
@@ -1177,6 +1199,24 @@ export function createOpenApiDocument() {
           summary: "Local server status",
           responses: {
             "200": jsonResponse("StatusResponse"),
+          },
+        },
+      },
+      "/v1/sync/stream": {
+        post: {
+          summary: "Stream active relay host synchronization invalidations",
+          requestBody: jsonRequest("HostSyncStreamRequest"),
+          responses: {
+            "200": {
+              description: "Server-sent events containing HostSyncEvent payloads",
+              content: {
+                "text/event-stream": {
+                  schema: { $ref: "#/components/schemas/HostSyncEvent" },
+                },
+              },
+            },
+            "400": jsonResponse("ErrorResponse"),
+            "401": jsonResponse("ErrorResponse"),
           },
         },
       },
@@ -1634,6 +1674,41 @@ export function createOpenApiDocument() {
             packageName: { type: "string", const: "codex-relay" },
             packageVersion: { type: "string" },
           },
+        },
+        HostSyncStreamRequest: {
+          type: "object",
+          additionalProperties: false,
+        },
+        HostSyncEvent: {
+          oneOf: [
+            {
+              type: "object",
+              required: ["type", "revision", "occurredAt", "reason"],
+              properties: {
+                type: { type: "string", const: "sync.required" },
+                revision: { type: "integer", minimum: 0 },
+                occurredAt: { type: "string", format: "date-time" },
+                reason: {
+                  type: "string",
+                  enum: ["connected", "upstream-reconnected"],
+                },
+              },
+            },
+            {
+              type: "object",
+              required: ["type", "revision", "occurredAt", "threadId", "change"],
+              properties: {
+                type: { type: "string", const: "thread.changed" },
+                revision: { type: "integer", minimum: 0 },
+                occurredAt: { type: "string", format: "date-time" },
+                threadId: { type: "string" },
+                change: {
+                  type: "string",
+                  enum: ["upserted", "activity", "removed"],
+                },
+              },
+            },
+          ],
         },
         RuntimePreferences: {
           type: "object",

@@ -5,6 +5,7 @@ import {
   CheckoutWorkspaceBranchRequestSchema,
   CommitPushWorkspaceRequestSchema,
   CreateThreadResponseSchema,
+  HostSyncStreamRequestSchema,
   InterruptThreadRunResponseSchema,
   ImageAttachmentUploadResponseSchema,
   ListModelsResponseSchema,
@@ -49,6 +50,7 @@ import {
   type CommitPushWorkspaceRequest,
   type CreateThreadRequest,
   type CreateThreadResponse,
+  type HostSyncEvent,
   type ImageAttachmentUploadResponse,
   type ListModelsResponse,
   type ListQueuedThreadInputsResponse,
@@ -105,6 +107,7 @@ import {
   persistSecureSession,
 } from "./secure-transport";
 import { startPairingTrialIfNeeded } from "./pairing-trial";
+import { hostSyncEventTypes, parseHostSyncStreamPayload } from "./host-sync-stream";
 import {
   createThreadRunSseDispatcher,
   parseThreadRunStreamPayload,
@@ -1133,6 +1136,67 @@ export function streamThreadRun(
   return () => {
     source.close();
   };
+}
+
+export function streamHostSync(
+  hostId: string,
+  handlers: {
+    onError: (error: Error) => void;
+    onEvent: (event: HostSyncEvent) => void;
+  },
+) {
+  const context = captureRelayRequestContext(hostId);
+  const requestUrl = `${context.serverUrl}${apiPaths.hostSyncStream}`;
+  const requestBody = encryptRequestPayload(HostSyncStreamRequestSchema.parse({}), context.hostId);
+  let closed = false;
+  const source = new EventSource<HostSyncEvent["type"]>(requestUrl, {
+    method: "POST",
+    headers: {
+      accept: "text/event-stream",
+      ...authorizationHeader(context),
+      "content-type": "application/json",
+      "x-codex-relay-client-session-id": getClientSessionId(),
+    },
+    body: requestBody,
+    pollingInterval: 0,
+  });
+
+  const close = () => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    source.close();
+  };
+
+  for (const type of hostSyncEventTypes) {
+    source.addEventListener(type, (event) => {
+      if (closed || !event.data) {
+        return;
+      }
+      try {
+        handlers.onEvent(
+          parseHostSyncStreamPayload(event.data, (payload) =>
+            decryptResponsePayload(payload, context.hostId),
+          ),
+        );
+      } catch {
+        close();
+        handlers.onError(new Error("Codex Relay server returned an invalid host sync event."));
+      }
+    });
+  }
+
+  source.addEventListener("error", (event) => {
+    if (closed) {
+      return;
+    }
+    const message = "message" in event ? event.message : "Codex Relay host sync stream failed.";
+    close();
+    handlers.onError(new Error(message));
+  });
+
+  return close;
 }
 
 function streamThreadRunWithDirectFetch(

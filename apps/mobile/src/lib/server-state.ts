@@ -97,8 +97,7 @@ export function fetchStatusState(queryClient: QueryClient, hostId = activeHostQu
   });
 }
 
-export function fetchThreadsState(queryClient: QueryClient) {
-  const hostId = activeHostQueryId();
+export function fetchThreadsState(queryClient: QueryClient, hostId = activeHostQueryId()) {
   return queryClient.fetchQuery({
     queryKey: serverStateKeys.threads(hostId),
     queryFn: () => listThreads(hostId),
@@ -125,8 +124,8 @@ export async function fetchThreadState(
   queryClient: QueryClient,
   threadId: string,
   options: { refresh?: boolean } = {},
+  hostId = activeHostQueryId(),
 ) {
-  const hostId = activeHostQueryId();
   const response = options.refresh
     ? await getThread(threadId, { refresh: true }, hostId)
     : await queryClient.fetchQuery({

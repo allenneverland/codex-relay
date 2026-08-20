@@ -2396,6 +2396,7 @@ describe("Codex Relay server routes", () => {
         });
         return appThread;
       }),
+      subscribeThread: vi.fn<() => Promise<unknown>>(async () => appThread),
     };
     const app = createApp({
       appServer: appServer as never,
@@ -2412,12 +2413,88 @@ describe("Codex Relay server routes", () => {
 
     expect(response.status).toBe(200);
     expect(appServer.readThread).toHaveBeenCalled();
+    expect(appServer.subscribeThread).toHaveBeenCalledTimes(1);
+    expect(appServer.subscribeThread).toHaveBeenCalledWith("app-thread-empty-stream");
     expect(body).toContain('"state":"running"');
     expect(body).toContain('"state":"idle"');
-    expect(notificationHandlers).toHaveLength(0);
+    expect(notificationHandlers).toHaveLength(1);
     expect(requestHandlers).toHaveLength(0);
     expect(cleanupNotificationHandler).toHaveBeenCalledTimes(1);
     expect(cleanupRequestHandler).toHaveBeenCalledTimes(1);
+  });
+
+  it("streams host invalidations and immediately subscribes externally started threads", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const now = Date.now() / 1000;
+    const appThread = {
+      id: "app-thread-host-sync",
+      createdAt: now,
+      cwd: workspacePath,
+      modelProvider: "gpt-5.5",
+      name: "Host sync",
+      preview: "Host sync",
+      source: "app",
+      status: { type: "active" },
+      turns: [],
+      updatedAt: now,
+    };
+    const appServer = {
+      onNotification(handler: (notification: unknown) => void) {
+        notificationHandlers.add(handler);
+        return () => notificationHandlers.delete(handler);
+      },
+      readThread: vi.fn<() => Promise<unknown>>(async () => appThread),
+      subscribeThread: vi.fn<() => Promise<unknown>>(async () => appThread),
+    };
+    const app = createApp({
+      appServer: appServer as never,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+    const response = await app.request("/v1/sync/stream", {
+      method: "POST",
+      body: JSON.stringify({}),
+      headers: { "content-type": "application/json" },
+    });
+    const reader = response.body?.getReader();
+    expect(reader).toBeDefined();
+    const decoder = new TextDecoder();
+    let streamedText = "";
+    const readUntil = async (value: string) => {
+      await Promise.race([
+        (async () => {
+          while (!streamedText.includes(value)) {
+            const result = await reader!.read();
+            if (result.done) {
+              throw new Error("Host sync stream closed unexpectedly.");
+            }
+            streamedText += decoder.decode(result.value, { stream: true });
+          }
+        })(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Timed out waiting for ${value}.`)), 1000),
+        ),
+      ]);
+    };
+
+    try {
+      expect(response.status).toBe(200);
+      await readUntil('"type":"sync.required"');
+
+      for (const handler of notificationHandlers) {
+        handler({ method: "thread/started", params: { thread: appThread } });
+      }
+      await vi.waitFor(() => expect(appServer.subscribeThread).toHaveBeenCalledTimes(1));
+      await readUntil('"change":"upserted"');
+
+      for (const handler of notificationHandlers) {
+        handler({ method: "turn/started", params: { threadId: appThread.id, turnId: "turn-1" } });
+      }
+      await readUntil('"change":"activity"');
+    } finally {
+      await reader?.cancel().catch(() => undefined);
+    }
   });
 
   it("does not accumulate preview probes or app-server handlers across cancelled attachments", async () => {

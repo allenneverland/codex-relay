@@ -68,6 +68,7 @@ import {
   setThreadMessagesLoading,
 } from "@/state/chat-store";
 import {
+  getActiveHostId,
   hasPairedHostSession,
   pairedHostDisplayName,
   pairedHostStore$,
@@ -415,6 +416,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     selectThread,
     toggleProject,
   } = useThreadDrawerActions({
+    activeHostId,
     activeThread,
     archiveThreadIsPending: archiveThreadMutation.isPending,
     archiveThreadMutateAsync: archiveThreadMutation.mutateAsync,
@@ -428,6 +430,22 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
     threadsById,
     workspacePath,
   });
+
+  const drawerWasVisibleRef = useRef(false);
+  const lastVisibleHostIdRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const becameVisible = isDrawerVisible && !drawerWasVisibleRef.current;
+    const changedHostWhileVisible =
+      isDrawerVisible && lastVisibleHostIdRef.current !== activeHostId;
+    drawerWasVisibleRef.current = isDrawerVisible;
+    if (!isDrawerVisible) {
+      return;
+    }
+    lastVisibleHostIdRef.current = activeHostId;
+    if (becameVisible || changedHostWhileVisible) {
+      void refreshProjects({ haptic: false });
+    }
+  }, [activeHostId, isDrawerVisible, refreshProjects]);
 
   const renderDrawerRow = useCallback(
     ({ item }: LegendListRenderItemProps<DrawerRow>) => (
@@ -653,6 +671,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
 }
 
 function useThreadDrawerActions({
+  activeHostId,
   activeThread,
   archiveThreadIsPending,
   archiveThreadMutateAsync,
@@ -666,6 +685,7 @@ function useThreadDrawerActions({
   threadsById,
   workspacePath,
 }: {
+  activeHostId: string | undefined;
   activeThread: ThreadSummary | undefined;
   archiveThreadIsPending: boolean;
   archiveThreadMutateAsync: (
@@ -693,21 +713,29 @@ function useThreadDrawerActions({
   );
 
   const syncPairedSessionState = useCallback(() => {
-    return hasPairedHostSession();
-  }, []);
+    return hasPairedHostSession(activeHostId);
+  }, [activeHostId]);
 
   const activateSelectedThread = useCallback(
     async (threadId: string) => {
+      if (getActiveHostId() !== activeHostId) {
+        return;
+      }
       const selectedThread = threadsById[threadId];
       setActiveThread(threadId);
       setThreadMessagesLoading(threadId, true);
       try {
-        const response = await fetchThreadState(queryClient, threadId);
+        const response = await fetchThreadState(queryClient, threadId, {}, activeHostId);
+        if (getActiveHostId() !== activeHostId) {
+          return;
+        }
         setThreadDetailState(
           queryClient,
           response.thread,
           response.messages,
           response.pendingInputRequests,
+          {},
+          activeHostId,
         );
         setActiveThread(response.thread.id);
         if (response.thread.state === "running") {
@@ -715,8 +743,11 @@ function useThreadDrawerActions({
         }
         setConnection("connected");
       } catch (caught) {
+        if (getActiveHostId() !== activeHostId) {
+          return;
+        }
         syncPairedSessionState();
-        setThreadRunningState(queryClient, selectedThread?.id ?? threadId, false);
+        setThreadRunningState(queryClient, selectedThread?.id ?? threadId, false, activeHostId);
         setConnection(
           "offline",
           caught instanceof Error ? caught.message : "Unable to load this Codex thread.",
@@ -725,7 +756,7 @@ function useThreadDrawerActions({
         setThreadMessagesLoading(threadId, false);
       }
     },
-    [queryClient, syncPairedSessionState, threadsById],
+    [activeHostId, queryClient, syncPairedSessionState, threadsById],
   );
 
   const selectThread = useCallback(
@@ -786,7 +817,7 @@ function useThreadDrawerActions({
           title: "New chat",
           workspacePath: selectedWorkspacePath,
         });
-        setThreadDetailState(queryClient, response.thread, response.messages);
+        setThreadDetailState(queryClient, response.thread, response.messages, [], {}, activeHostId);
         setActiveThread(response.thread.id);
         setConnection("connected");
         hapticSuccess();
@@ -804,6 +835,7 @@ function useThreadDrawerActions({
     },
     [
       createThreadMutateAsync,
+      activeHostId,
       dispatchUi,
       isCreatingThread,
       navigation,
@@ -820,35 +852,43 @@ function useThreadDrawerActions({
     [dispatchUi],
   );
 
-  const refreshProjects = useCallback(async () => {
-    if (isRefreshingProjects) {
-      return;
-    }
-
-    dispatchUi({ type: "set-refreshing-projects", value: true });
-    setConnection("checking");
-    hapticLightImpact();
-    try {
-      const response = await fetchThreadsState(queryClient);
-      setThreadsState(queryClient, response.threads, response.source);
-      const currentActiveThreadId = chatStore$.activeThreadId.peek();
-      if (
-        currentActiveThreadId &&
-        !response.threads.some((thread) => thread.id === currentActiveThreadId)
-      ) {
-        setActiveThread(response.threads[0]?.id);
+  const refreshProjects = useCallback(
+    async (options: { haptic?: boolean } = {}) => {
+      if (isRefreshingProjects) {
+        return;
       }
-      setConnection("connected");
-    } catch (caught) {
-      syncPairedSessionState();
-      setConnection(
-        "offline",
-        caught instanceof Error ? caught.message : "Unable to refresh projects.",
-      );
-    } finally {
-      dispatchUi({ type: "set-refreshing-projects", value: false });
-    }
-  }, [dispatchUi, isRefreshingProjects, queryClient, syncPairedSessionState]);
+
+      dispatchUi({ type: "set-refreshing-projects", value: true });
+      setConnection("checking");
+      if (options.haptic !== false) {
+        hapticLightImpact();
+      }
+      try {
+        const response = await fetchThreadsState(queryClient, activeHostId);
+        setThreadsState(queryClient, response.threads, response.source, activeHostId);
+        if (getActiveHostId() !== activeHostId) {
+          return;
+        }
+        const currentActiveThreadId = chatStore$.activeThreadId.peek();
+        if (
+          currentActiveThreadId &&
+          !response.threads.some((thread) => thread.id === currentActiveThreadId)
+        ) {
+          setActiveThread(response.threads[0]?.id);
+        }
+        setConnection("connected");
+      } catch (caught) {
+        syncPairedSessionState();
+        setConnection(
+          "offline",
+          caught instanceof Error ? caught.message : "Unable to refresh projects.",
+        );
+      } finally {
+        dispatchUi({ type: "set-refreshing-projects", value: false });
+      }
+    },
+    [activeHostId, dispatchUi, isRefreshingProjects, queryClient, syncPairedSessionState],
+  );
 
   const archiveThread = useCallback(
     async (threadId: string) => {

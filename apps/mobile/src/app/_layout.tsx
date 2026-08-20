@@ -18,6 +18,7 @@ import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 
 import { AnimatedSplashOverlay } from "@/components/animated-icon";
+import { ActiveHostSyncCoordinator } from "@/components/ActiveHostSyncCoordinator";
 import { useInitialPushNotificationRegistration } from "@/hooks/use-initial-push-notification-registration";
 import { addHotUpdaterLog, formatHotUpdaterProgress } from "@/lib/hot-updater-logs";
 import {
@@ -205,6 +206,7 @@ function TabLayout() {
         persister: queryClientPersister,
       }}
     >
+      <ActiveHostSyncCoordinator />
       <ThemeProvider value={appTheme}>
         <GestureHandlerRootView style={{ flex: 1 }}>
           <KeyboardProvider>

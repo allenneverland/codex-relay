@@ -6,6 +6,8 @@ import {
   CreateThreadRequestSchema,
   EncryptedPayloadSchema,
   ImageAttachmentUploadResponseSchema,
+  HostSyncEventSchema,
+  HostSyncStreamRequestSchema,
   InterruptThreadRunResponseSchema,
   ListModelsResponseSchema,
   ListQueuedThreadInputsResponseSchema,
@@ -67,6 +69,7 @@ import {
   type ChatMessage,
   type CreateThreadResponse,
   type ErrorResponse,
+  type HostSyncEvent,
   type ImageAttachmentUploadResponse,
   type ListThreadsResponse,
   type ListWorkspaceFilesResponse,
@@ -310,7 +313,59 @@ type WorkspaceTerminalSession = {
   workspacePath: string;
 };
 
+type HostSyncSubscriber = (event: HostSyncEvent) => boolean;
+type HostSyncEventInput =
+  | { reason: "connected" | "upstream-reconnected"; type: "sync.required" }
+  | {
+      change: "upserted" | "activity" | "removed";
+      threadId: string;
+      type: "thread.changed";
+    };
+
+type AppServerThreadSubscriptionCoordinator = {
+  ensureSubscribed: (
+    threadId: string,
+    knownThread?: AppServerThread,
+  ) => Promise<AppServerThread | undefined>;
+};
+
 const maxWorkspaceTerminalOutputChunks = 2000;
+
+function createHostSyncEventHub() {
+  const subscribers = new Set<HostSyncSubscriber>();
+  let revision = 0;
+
+  const createEvent = (event: HostSyncEventInput): HostSyncEvent =>
+    HostSyncEventSchema.parse({
+      ...event,
+      occurredAt: new Date().toISOString(),
+      revision: ++revision,
+    });
+
+  const publish = (event: HostSyncEvent) => {
+    for (const subscriber of subscribers) {
+      if (!subscriber(event)) {
+        subscribers.delete(subscriber);
+      }
+    }
+  };
+
+  return {
+    publishSyncRequired(reason: "connected" | "upstream-reconnected") {
+      publish(createEvent({ type: "sync.required", reason }));
+    },
+    publishThreadChanged(threadId: string, change: "upserted" | "activity" | "removed") {
+      publish(createEvent({ type: "thread.changed", threadId, change }));
+    },
+    subscribe(subscriber: HostSyncSubscriber) {
+      subscribers.add(subscriber);
+      if (!subscriber(createEvent({ type: "sync.required", reason: "connected" }))) {
+        subscribers.delete(subscriber);
+      }
+      return () => subscribers.delete(subscriber);
+    },
+  };
+}
 
 export function createApp(options: AppOptions = {}) {
   const app = new Hono();
@@ -342,6 +397,7 @@ export function createApp(options: AppOptions = {}) {
     ReadableStreamDefaultController<Uint8Array>,
     () => void
   >();
+  const hostSyncEvents = createHostSyncEventHub();
   const threadOptions = { workingDirectory: workspacePath };
   function runThreadOperation<T>(threadId: string, operation: () => Promise<T>) {
     const previous = threadOperationTails.get(threadId) ?? Promise.resolve();
@@ -385,16 +441,26 @@ export function createApp(options: AppOptions = {}) {
         sessions: options.pairing.sessions,
       })
     : undefined;
-  if (appServer && pushNotificationDispatcher) {
+  const appServerThreadSubscriptions = appServer
+    ? startAppServerThreadSubscriptionCoordinator({
+        appServer,
+        hostSyncEvents,
+        reconcilePushNotifications:
+          pushNotificationDispatcher && options.pairing
+            ? () =>
+                reconcileAppServerPushNotifications(
+                  appServer,
+                  pushNotificationDispatcher,
+                  options.pairing!.sessions,
+                )
+            : undefined,
+      })
+    : undefined;
+  if (appServer && pushNotificationDispatcher && options.pairing) {
     observeAppServerPushNotifications(
       appServer,
       pushNotificationDispatcher,
-      options.pairing!.sessions,
-    );
-    startAppServerPushNotificationReconciliation(
-      appServer,
-      pushNotificationDispatcher,
-      options.pairing!.sessions,
+      options.pairing.sessions,
     );
   }
   const scheduleAppServerHistoryLoad = (threadId: string, cachedMessages: ChatMessage[]) => {
@@ -693,6 +759,88 @@ export function createApp(options: AppOptions = {}) {
     });
 
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.post(apiPaths.hostSyncStream, async (c) => {
+    const parsed = await parseRequestJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      HostSyncStreamRequestSchema,
+    );
+    if (!parsed.success) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        validationError(parsed.error),
+        400,
+      );
+    }
+
+    const encoder = new TextEncoder();
+    const secureSession = getSecureSessionForRequest(c, options.pairing, secureSessionsByTokenHash);
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let closed = false;
+    let stopHeartbeat: ReturnType<typeof setInterval> | undefined;
+    let unsubscribe = () => {};
+
+    const closeStream = () => {
+      if (closed) {
+        return;
+      }
+      closed = true;
+      if (stopHeartbeat) {
+        clearInterval(stopHeartbeat);
+        stopHeartbeat = undefined;
+      }
+      unsubscribe();
+      if (streamController) {
+        activeStreamControllers.delete(streamController);
+        closeSseController(streamController);
+      }
+    };
+
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+        activeStreamControllers.set(controller, closeStream);
+        unsubscribe = hostSyncEvents.subscribe((event) => {
+          if (closed) {
+            return false;
+          }
+          if (!sendHostSyncSse(controller, encoder, secureSession, event)) {
+            closeStream();
+            return false;
+          }
+          return true;
+        });
+        if (closed) {
+          return;
+        }
+        stopHeartbeat = setInterval(() => {
+          if (
+            !closed &&
+            streamController &&
+            !enqueueSseChunk(streamController, encoder.encode(": keep-alive\n\n"))
+          ) {
+            closeStream();
+          }
+        }, 15_000);
+      },
+      cancel() {
+        closeStream();
+      },
+    });
+
+    return new Response(stream, {
+      headers: {
+        "cache-control": "no-cache, no-transform",
+        connection: "keep-alive",
+        "content-type": "text/event-stream",
+        "x-accel-buffering": "no",
+      },
+    });
   });
 
   app.delete(apiPaths.session, async (c) => {
@@ -1800,6 +1948,7 @@ export function createApp(options: AppOptions = {}) {
         activeAppServerTurnIdsByThreadId.delete(threadId);
         queuedInputsByThreadId.delete(threadId);
         steeringThreads.delete(threadId);
+        hostSyncEvents.publishThreadChanged(threadId, "removed");
 
         const appServerThreads = await appServer.listThreads();
         const response: ArchiveThreadResponse = ArchiveThreadResponseSchema.parse({
@@ -1838,6 +1987,7 @@ export function createApp(options: AppOptions = {}) {
     messagesByThreadId.delete(threadId);
     queuedInputsByThreadId.delete(threadId);
     steeringThreads.delete(threadId);
+    hostSyncEvents.publishThreadChanged(threadId, "removed");
     const response: ArchiveThreadResponse = ArchiveThreadResponseSchema.parse({
       archivedThreadId: threadId,
       threads: sortedThreads(threads),
@@ -1898,6 +2048,7 @@ export function createApp(options: AppOptions = {}) {
           await appServer.readThread(threadId, { includeTurns: false }),
         );
       });
+      hostSyncEvents.publishThreadChanged(threadId, "upserted");
       return secureJson(
         c,
         options.pairing,
@@ -2589,6 +2740,8 @@ export function createApp(options: AppOptions = {}) {
           ),
         });
 
+    hostSyncEvents.publishThreadChanged(threadId, "upserted");
+
     const skills = runOptions.skills ?? [];
     const prompt = runOptions.prompt;
 
@@ -3064,6 +3217,7 @@ export function createApp(options: AppOptions = {}) {
             appServer,
             controller,
             encoder,
+            ensureSubscribed: appServerThreadSubscriptions?.ensureSubscribed,
             messagesByThreadId,
             pendingApprovals,
             secureSession,
@@ -3801,6 +3955,7 @@ async function streamRunningAppServerThread(input: {
   appServer: CodexAppServerClient;
   controller: ReadableStreamDefaultController<Uint8Array>;
   encoder: TextEncoder;
+  ensureSubscribed?: (threadId: string) => Promise<AppServerThread | undefined>;
   messagesByThreadId: Map<string, ChatMessage[]>;
   pendingApprovals: Map<string, PendingApproval>;
   secureSession?: SecureSessionHandle;
@@ -4143,6 +4298,12 @@ async function streamRunningAppServerThread(input: {
   });
 
   try {
+    if (input.ensureSubscribed) {
+      await Promise.race([input.ensureSubscribed(input.threadId), aborted]);
+    }
+    if (input.signal.aborted) {
+      return;
+    }
     const appServerThread = await Promise.race([
       input.appServer.readThread(input.threadId, { includeTurns: false }),
       aborted.then(() => undefined),
@@ -5893,6 +6054,25 @@ function sendSse(
     return false;
   }
   return true;
+}
+
+function sendHostSyncSse(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+  secureSession: SecureSessionHandle | undefined,
+  event: HostSyncEvent,
+) {
+  const parsed = HostSyncEventSchema.parse(event);
+  const data = secureSession
+    ? EncryptedPayloadSchema.parse(encryptForMobile(secureSession.session, JSON.stringify(parsed)))
+    : parsed;
+  if (secureSession) {
+    void secureSession.persist().catch(() => undefined);
+  }
+  if (!enqueueSseChunk(controller, encoder.encode(`event: ${parsed.type}\n`))) {
+    return false;
+  }
+  return enqueueSseChunk(controller, encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
 }
 
 function sendTerminalOutputSse(
@@ -8017,61 +8197,181 @@ function pushNotificationWaitingState(notification: AppServerNotification) {
   };
 }
 
-function startAppServerPushNotificationReconciliation(
-  appServer: CodexAppServerClient,
-  dispatcher: PushNotificationDispatcher,
-  sessions: PairingSessionStore,
-) {
-  if (
-    typeof appServer.listLoadedThreads !== "function" ||
-    typeof appServer.subscribeThread !== "function"
-  ) {
-    return;
-  }
+function startAppServerThreadSubscriptionCoordinator(input: {
+  appServer: CodexAppServerClient;
+  hostSyncEvents: ReturnType<typeof createHostSyncEventHub>;
+  reconcilePushNotifications?: () => Promise<void>;
+}): AppServerThreadSubscriptionCoordinator {
+  const { appServer, hostSyncEvents } = input;
   const subscribedThreadIds = new Set<string>();
-  let connectionGeneration = -1;
+  const ignoredThreadIds = new Set<string>();
+  const pendingSubscriptions = new Map<string, Promise<AppServerThread | undefined>>();
+  let connectionGeneration: number | undefined;
   let running = false;
+  let reconciliationRequested = false;
+
+  const updateConnectionGeneration = () => {
+    const nextGeneration = appServer.appServerConnectionGeneration;
+    if (typeof nextGeneration !== "number") {
+      return false;
+    }
+    if (connectionGeneration === undefined) {
+      connectionGeneration = nextGeneration;
+      return false;
+    }
+    if (connectionGeneration === nextGeneration) {
+      return false;
+    }
+    connectionGeneration = nextGeneration;
+    subscribedThreadIds.clear();
+    ignoredThreadIds.clear();
+    pendingSubscriptions.clear();
+    hostSyncEvents.publishSyncRequired("upstream-reconnected");
+    return true;
+  };
+
+  const ensureSubscribed: AppServerThreadSubscriptionCoordinator["ensureSubscribed"] = (
+    threadId,
+    knownThread,
+  ) => {
+    updateConnectionGeneration();
+    if (ignoredThreadIds.has(threadId)) {
+      return Promise.resolve(undefined);
+    }
+    const pending = pendingSubscriptions.get(threadId);
+    if (pending) {
+      return pending;
+    }
+
+    const subscription = (async () => {
+      const thread =
+        knownThread ??
+        (typeof appServer.readThread === "function"
+          ? await appServer.readThread(threadId, { includeTurns: false })
+          : undefined);
+      updateConnectionGeneration();
+      if (thread && isSubagentThread(thread)) {
+        ignoredThreadIds.add(threadId);
+        subscribedThreadIds.delete(threadId);
+        return undefined;
+      }
+      if (subscribedThreadIds.has(threadId)) {
+        return thread;
+      }
+      if (typeof appServer.subscribeThread !== "function") {
+        return thread;
+      }
+      const subscribedThread = await appServer.subscribeThread(threadId);
+      if (isSubagentThread(subscribedThread)) {
+        ignoredThreadIds.add(threadId);
+        return undefined;
+      }
+      subscribedThreadIds.add(threadId);
+      return subscribedThread;
+    })();
+    pendingSubscriptions.set(threadId, subscription);
+    const clearPendingSubscription = () => {
+      if (pendingSubscriptions.get(threadId) === subscription) {
+        pendingSubscriptions.delete(threadId);
+      }
+    };
+    void subscription.then(clearPendingSubscription, clearPendingSubscription);
+    return subscription;
+  };
+
+  const handleNotification = async (notification: AppServerNotification) => {
+    const change = hostSyncChangeFromAppServerNotification(notification.method);
+    if (!change) {
+      return;
+    }
+    const params = recordParams(notification);
+    const knownThread = appServerThreadFromNotification(params);
+    const threadId = firstString(params, ["threadId", "conversationId"]) ?? knownThread?.id;
+    if (!threadId || ignoredThreadIds.has(threadId)) {
+      return;
+    }
+    if (change === "removed") {
+      if (!knownThread || !isSubagentThread(knownThread)) {
+        hostSyncEvents.publishThreadChanged(threadId, change);
+      }
+      subscribedThreadIds.delete(threadId);
+      return;
+    }
+
+    const rootThread =
+      subscribedThreadIds.has(threadId) && !knownThread
+        ? undefined
+        : await ensureSubscribed(threadId, knownThread);
+    if (ignoredThreadIds.has(threadId) || (knownThread && isSubagentThread(knownThread))) {
+      return;
+    }
+    if (!subscribedThreadIds.has(threadId) && !rootThread) {
+      return;
+    }
+    hostSyncEvents.publishThreadChanged(threadId, change);
+  };
+
+  if (
+    typeof appServer.onNotification === "function" &&
+    typeof appServer.subscribeThread === "function"
+  ) {
+    appServer.onNotification((notification) => {
+      void handleNotification(notification).catch((error) => {
+        relayDebugLog("app_server.thread_subscription.notification_failed", {
+          error: errorMessage(error),
+          method: notification.method,
+        });
+      });
+    });
+  }
 
   const run = async (reconcile: boolean) => {
+    reconciliationRequested ||= reconcile;
     if (running) {
       return;
     }
     running = true;
     try {
+      const shouldReconcile = reconciliationRequested;
+      reconciliationRequested = false;
       await appServer.initialize();
-      const nextConnectionGeneration = appServer.appServerConnectionGeneration;
-      const reconnected = nextConnectionGeneration !== connectionGeneration;
-      if (reconnected) {
-        connectionGeneration = nextConnectionGeneration;
-        subscribedThreadIds.clear();
-      }
+      const reconnected = updateConnectionGeneration();
 
       const loadedThreads = await appServer.listLoadedThreads();
       for (const thread of loadedThreads) {
-        if (isSubagentThread(thread) || subscribedThreadIds.has(thread.id)) {
-          continue;
-        }
-        await appServer.subscribeThread(thread.id);
-        subscribedThreadIds.add(thread.id);
+        await ensureSubscribed(thread.id, thread);
       }
 
-      if (reconcile || reconnected) {
-        await reconcileAppServerPushNotifications(appServer, dispatcher, sessions);
+      if ((shouldReconcile || reconnected) && input.reconcilePushNotifications) {
+        await input.reconcilePushNotifications();
       }
     } catch (error) {
-      relayDebugLog("push_notification.reconciliation_failed", {
+      relayDebugLog("app_server.thread_subscription.discovery_failed", {
         error: errorMessage(error),
       });
     } finally {
       running = false;
+      if (reconciliationRequested) {
+        void run(false);
+      }
     }
   };
 
-  void run(true);
-  const subscriptionTimer = setInterval(() => void run(false), 10_000);
-  const reconciliationTimer = setInterval(() => void run(true), 60_000);
-  (subscriptionTimer as unknown as { unref(): void }).unref();
-  (reconciliationTimer as unknown as { unref(): void }).unref();
+  if (
+    typeof appServer.initialize === "function" &&
+    typeof appServer.listLoadedThreads === "function" &&
+    typeof appServer.subscribeThread === "function"
+  ) {
+    void run(Boolean(input.reconcilePushNotifications));
+    const subscriptionTimer = setInterval(() => void run(false), 1_000);
+    (subscriptionTimer as unknown as { unref(): void }).unref();
+    if (input.reconcilePushNotifications) {
+      const reconciliationTimer = setInterval(() => void run(true), 60_000);
+      (reconciliationTimer as unknown as { unref(): void }).unref();
+    }
+  }
+
+  return { ensureSubscribed };
 }
 
 async function reconcileAppServerPushNotifications(
@@ -8569,6 +8869,45 @@ function recordParams(message: { params?: unknown } | AppServerNotification | Ap
   return message.params && typeof message.params === "object"
     ? (message.params as Record<string, unknown>)
     : undefined;
+}
+
+function appServerThreadFromNotification(
+  params: Record<string, unknown> | undefined,
+): AppServerThread | undefined {
+  const thread = params?.thread;
+  if (!thread || typeof thread !== "object") {
+    return undefined;
+  }
+  return typeof (thread as { id?: unknown }).id === "string"
+    ? (thread as AppServerThread)
+    : undefined;
+}
+
+function hostSyncChangeFromAppServerNotification(
+  method: string,
+): "upserted" | "activity" | "removed" | undefined {
+  switch (method) {
+    case "thread/started":
+    case "thread/name/updated":
+    case "thread/goal/updated":
+    case "thread/goal/cleared":
+    case "thread/unarchived":
+      return "upserted";
+    case "thread/archived":
+    case "thread/closed":
+      return "removed";
+    case "thread/status/changed":
+    case "turn/started":
+    case "turn/aborted":
+    case "turn/cancelled":
+    case "turn/completed":
+    case "turn/failed":
+    case "item/started":
+    case "item/completed":
+      return "activity";
+    default:
+      return undefined;
+  }
 }
 
 function turnIdFromParams(params: Record<string, unknown> | undefined) {
