@@ -22,7 +22,7 @@ import { useInitialPushNotificationRegistration } from "@/hooks/use-initial-push
 import { addHotUpdaterLog, formatHotUpdaterProgress } from "@/lib/hot-updater-logs";
 import {
   configurePushNotificationPresentation,
-  notificationResponseThreadId,
+  notificationResponseTarget,
   supportsPushNotifications,
 } from "@/lib/push-notifications";
 import {
@@ -31,7 +31,13 @@ import {
   shouldPersistQuery,
 } from "@/lib/query-persistence";
 import { restoreChatStoreFromQueryCache } from "@/lib/server-state-hydration";
-import { setActiveThread } from "@/state/chat-store";
+import { resetChatSessionState, setActiveThread, setConnection } from "@/state/chat-store";
+import {
+  getActiveHostId,
+  getPairedHosts,
+  setActivePairedHost,
+  setPendingNotificationTarget,
+} from "@/state/paired-host-store";
 
 void SplashScreen.preventAutoHideAsync();
 configurePushNotificationPresentation();
@@ -151,11 +157,24 @@ function TabLayout() {
       return;
     }
     const openNotificationThread = (response: Notifications.NotificationResponse) => {
-      const threadId = notificationResponseThreadId(response);
-      if (!threadId) {
+      const target = notificationResponseTarget(response);
+      if (!target) {
         return;
       }
-      setActiveThread(threadId);
+      const hostId = target.relayId
+        ? getPairedHosts().find((host) => host.relayId === target.relayId)?.id
+        : getActiveHostId();
+      if (!hostId) {
+        Notifications.clearLastNotificationResponse();
+        return;
+      }
+      if (hostId !== getActiveHostId()) {
+        setActivePairedHost(hostId);
+        resetChatSessionState();
+      }
+      setPendingNotificationTarget({ hostId, threadId: target.threadId });
+      setActiveThread(target.threadId);
+      setConnection("checking");
       router.replace("/");
       Notifications.clearLastNotificationResponse();
     };
@@ -178,7 +197,7 @@ function TabLayout() {
       client={queryClient}
       onSuccess={() => restoreChatStoreFromQueryCache(queryClient)}
       persistOptions={{
-        buster: "codex-relay-server-state-v1",
+        buster: "codex-relay-server-state-v2",
         dehydrateOptions: {
           shouldDehydrateQuery: shouldPersistQuery,
         },

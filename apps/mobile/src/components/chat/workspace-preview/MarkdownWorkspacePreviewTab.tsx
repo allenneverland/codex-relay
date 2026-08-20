@@ -7,6 +7,8 @@ import { ThemedText } from "@/components/themed-text";
 import { Icon } from "@/components/ui/icon";
 import { Colors, Spacing } from "@/constants/theme";
 import { getWorkspaceFileContent } from "@/lib/codex-relay-api";
+import { relayHostIdFromQueryKey } from "@/lib/workspace-file-queries";
+import { getActiveHostId } from "@/state/paired-host-store";
 
 import { HighlightedCodeBlock } from "../MessageBubble";
 import type { WorkspaceMarkdownPreviewTarget } from "./markdown-target";
@@ -23,13 +25,18 @@ export const MarkdownWorkspacePreviewTab = memo(function MarkdownWorkspacePrevie
   const [isPullRefreshing, setPullRefreshing] = useState(false);
   const fileContentQuery = useQuery({
     enabled: Boolean(target?.path),
-    queryFn: () =>
-      getWorkspaceFileContent({
-        path: target?.path ?? "",
-        workspacePath: targetWorkspacePath,
-      }),
+    queryFn: ({ queryKey }) =>
+      getWorkspaceFileContent(
+        {
+          path: target?.path ?? "",
+          workspacePath: targetWorkspacePath,
+        },
+        relayHostIdFromQueryKey(queryKey),
+      ),
     queryKey: [
-      "codex-relay-workspace-preview-markdown",
+      "codex-relay",
+      getActiveHostId() ?? "__unpaired__",
+      "workspace-preview-markdown",
       targetWorkspacePath ?? null,
       target?.path ?? null,
     ],

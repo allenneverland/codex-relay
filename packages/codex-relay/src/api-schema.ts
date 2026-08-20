@@ -57,6 +57,12 @@ export const VersionResponseSchema = z.object({
   packageVersion: z.string().min(1),
 });
 
+export const RelayIdSchema = z.string().trim().min(1);
+
+export function relayIdFromServerPublicKey(serverPublicKey: string) {
+  return serverPublicKey.trim().replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
 export const ThreadRunOptionsSchema = z.object({
   model: z.string().trim().min(1).optional(),
   serviceTier: z.string().trim().min(1).optional(),
@@ -351,6 +357,7 @@ export const ThreadSummarySchema = z.object({
 export const StatusResponseSchema = z.object({
   ok: z.boolean(),
   service: z.literal("codex-relay-server"),
+  relayId: RelayIdSchema.optional(),
   sdkAvailable: z.boolean(),
   machineName: z.string().min(1),
   workspacePath: z.string(),
@@ -1097,6 +1104,7 @@ export const apiPaths = {
   pairApproval: (approvalCode: string) => `/v1/pair/${encodeURIComponent(approvalCode)}`,
   pairApprove: "/v1/pair/approve",
   sessionsClear: "/v1/sessions/clear",
+  session: "/v1/session",
   sessionRefresh: "/v1/session/refresh",
   status: "/v1/status",
   preferences: "/v1/preferences",
@@ -1169,6 +1177,15 @@ export function createOpenApiDocument() {
           summary: "Local server status",
           responses: {
             "200": jsonResponse("StatusResponse"),
+          },
+        },
+      },
+      "/v1/session": {
+        delete: {
+          summary: "Revoke the currently authorized paired session",
+          responses: {
+            "204": { description: "Session revoked" },
+            "401": jsonResponse("ErrorResponse"),
           },
         },
       },
@@ -1594,6 +1611,7 @@ export function createOpenApiDocument() {
           ],
           properties: {
             ok: { type: "boolean" },
+            relayId: { type: "string" },
             service: { type: "string", const: "codex-relay-server" },
             sdkAvailable: { type: "boolean" },
             machineName: { type: "string" },

@@ -60,6 +60,7 @@ import {
   createOpenApiDocument,
   normalizePromptContext,
   promptMarkdownWithSkills,
+  relayIdFromServerPublicKey,
   stripPromptSkillMentions,
   type ApprovalMode,
   type ArchiveThreadResponse,
@@ -374,8 +375,12 @@ export function createApp(options: AppOptions = {}) {
   }
   const pushNotificationSender =
     options.pushNotificationSender ?? createApnsPushNotificationSenderFromEnvironment();
+  const relayId = options.pairing?.serverIdentity
+    ? relayIdFromServerPublicKey(options.pairing.serverIdentity.publicKey)
+    : undefined;
   const pushNotificationDispatcher = options.pairing
     ? createPushNotificationDispatcher({
+        relayId,
         sender: pushNotificationSender,
         sessions: options.pairing.sessions,
       })
@@ -676,6 +681,7 @@ export function createApp(options: AppOptions = {}) {
   app.get(apiPaths.status, async (c) => {
     const response: StatusResponse = StatusResponseSchema.parse({
       ok: true,
+      relayId,
       service: "codex-relay-server",
       sdkAvailable: Boolean(codex),
       machineName: hostname(),
@@ -687,6 +693,20 @@ export function createApp(options: AppOptions = {}) {
     });
 
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.delete(apiPaths.session, async (c) => {
+    if (!options.pairing) {
+      return c.body(null, 204);
+    }
+    const token = parseBearerToken(c.req.header("authorization"));
+    if (!token) {
+      return c.json(apiError("unauthorized", "Pair this device with the Codex Relay server."), 401);
+    }
+    const tokenHash = options.pairing.hashClientToken(token);
+    await options.pairing.sessions.deleteSession(tokenHash);
+    secureSessionsByTokenHash.delete(tokenHash);
+    return c.body(null, 204);
   });
 
   app.patch(apiPaths.preferences, async (c) => {
@@ -7885,10 +7905,13 @@ function observeAppServerPushNotifications(
 ) {
   const dispatchForRootThread = (event: PushNotificationEvent) => {
     void appServer
-      .readThread(event.threadId, { includeTurns: false })
+      .readThread(event.threadId, { includeTurns: !event.body })
       .then((thread) => {
         if (!isSubagentThread(thread)) {
-          return dispatcher.dispatch(event);
+          return dispatcher.dispatch({
+            ...event,
+            body: event.body ?? pushNotificationBodyFromThread(thread, event.turnId),
+          });
         }
       })
       .catch((error) => {
@@ -7912,7 +7935,7 @@ function observeAppServerPushNotifications(
       return;
     }
     void appServer
-      .readThread(waitingState.threadId, { includeTurns: false })
+      .readThread(waitingState.threadId, { includeTurns: true })
       .then(async (thread) => {
         if (isSubagentThread(thread)) {
           return;
@@ -7924,6 +7947,7 @@ function observeAppServerPushNotifications(
         );
         if (generation) {
           await dispatcher.dispatch({
+            body: pushNotificationBodyFromThread(thread, waitingState.turnId),
             eventId: `action_required:${waitingState.threadId}:${generation}`,
             intent: "action_required",
             threadId: waitingState.threadId,
@@ -7961,7 +7985,9 @@ function pushNotificationEventFromTerminalNotification(notification: AppServerNo
   if (!threadId) {
     return undefined;
   }
+  const turn = params?.turn;
   return {
+    body: pushNotificationBodyFromTurn(turn),
     eventId: `turn_terminal:${threadId}:${firstString(params, ["turnId"]) ?? turnIdFromParams(params) ?? "unknown"}`,
     intent: "turn_terminal" as const,
     threadId,
@@ -8088,6 +8114,7 @@ async function reconcileAppServerPushNotifications(
     const generation = await sessions.recordThreadWaitingState(thread.id, waiting, Date.now());
     if (!baseline && generation) {
       await dispatcher.dispatch({
+        body: pushNotificationBodyFromThread(thread, latestActiveTurnId(thread)),
         eventId: `action_required:${thread.id}:${generation}`,
         intent: "action_required",
         threadId: thread.id,
@@ -8108,6 +8135,7 @@ async function reconcileAppServerPushNotifications(
         continue;
       }
       await dispatcher.dispatch({
+        body: pushNotificationBodyFromTurn(turn),
         eventId: `turn_terminal:${thread.id}:${turn.id}`,
         intent: "turn_terminal",
         threadId: thread.id,
@@ -8133,6 +8161,47 @@ function appServerThreadWaitingOnUser(thread: AppServerThread) {
 
 function latestActiveTurnId(thread: AppServerThread) {
   return [...(thread.turns ?? [])].reverse().find((turn) => turn.completedAt === null)?.id;
+}
+
+function pushNotificationBodyFromThread(thread: AppServerThread, turnId?: string) {
+  const turns = thread.turns ?? [];
+  const turn =
+    (turnId ? turns.find((candidate) => candidate.id === turnId) : undefined) ?? turns.at(-1);
+  return pushNotificationBodyFromTurn(turn);
+}
+
+function pushNotificationBodyFromTurn(turn: unknown) {
+  if (!turn || typeof turn !== "object") {
+    return undefined;
+  }
+  const record = turn as Record<string, unknown>;
+  const items = Array.isArray(record.items) ? record.items : [];
+  for (const item of [...items].reverse()) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const itemRecord = item as Record<string, unknown>;
+    if (itemRecord.type !== "agentMessage" || typeof itemRecord.text !== "string") {
+      continue;
+    }
+    const content =
+      proposedPlanContent(itemRecord.text) ?? agentMessageParts(itemRecord.text).content;
+    return compactPushNotificationBody(content);
+  }
+  const error = record.error;
+  if (error && typeof error === "object") {
+    return compactPushNotificationBody(firstString(error as Record<string, unknown>, ["message"]));
+  }
+  return undefined;
+}
+
+function compactPushNotificationBody(content: string | undefined) {
+  const normalized = content?.replace(/\s+/g, " ").trim();
+  if (!normalized) {
+    return undefined;
+  }
+  const characters = Array.from(normalized);
+  return characters.length > 900 ? `${characters.slice(0, 897).join("")}...` : normalized;
 }
 
 function approvalMessageFromRequest(request: AppServerRequest) {

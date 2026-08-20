@@ -25,6 +25,7 @@ import {
   getPushNotificationSettings,
   registerPushNotifications,
   refreshSession,
+  revokeCodexRelaySession,
   sendTestPushNotification,
   setCodexRelayServerUrl,
   signOutCodexRelaySession,
@@ -51,7 +52,21 @@ import {
   serverStateQueryFns,
   setStatusState,
 } from "@/lib/server-state";
-import { chatStore$, resetChatSessionState, setConnection, setServerUrl } from "@/state/chat-store";
+import { removeCachedWorkspaceRuntimePreferencesForHost } from "@/lib/workspace-runtime-preferences-cache";
+import {
+  chatStore$,
+  removeChatHostLocalState,
+  resetChatSessionState,
+  setConnection,
+} from "@/state/chat-store";
+import {
+  hasPairedHostSession,
+  pairedHostDisplayName,
+  pairedHostStore$,
+  setActivePairedHost,
+} from "@/state/paired-host-store";
+import { removePinnedThreadHostState } from "@/state/pinned-thread-store";
+import { removeWorkspacePreviewHostState } from "@/state/workspace-preview-store";
 
 import mobilePackage from "../../package.json";
 
@@ -67,22 +82,21 @@ type PushNotificationPreference = keyof typeof defaultPushNotificationPreference
 export default function SettingsScreen() {
   const queryClient = useQueryClient();
   const connection = useSelector(() => chatStore$.connection.get());
-  const hasPairedSession = useSelector(() => chatStore$.hasPairedSession.get());
-  const serverUrl = useSelector(() => chatStore$.serverUrl.get());
-  const statusQuery = useQuery({
-    queryKey: serverStateKeys.status(),
-    queryFn: serverStateQueryFns.status,
-    enabled: false,
+  const pairedHostRegistry = useSelector(() => pairedHostStore$.get());
+  const activeHostId = pairedHostRegistry.activeHostId;
+  const pairedHosts = pairedHostRegistry.hostIds.flatMap((hostId) => {
+    const host = pairedHostRegistry.hostsById[hostId];
+    return host ? [host] : [];
   });
+  const activeHost = activeHostId ? pairedHostRegistry.hostsById[activeHostId] : undefined;
+  const hasPairedSession = Boolean(activeHost && hasPairedHostSession(activeHostId));
+  const serverUrl = activeHost?.activeUrl ?? "";
   const rateLimitsQuery = useQuery({
     queryKey: serverStateKeys.rateLimits(),
     queryFn: serverStateQueryFns.rateLimits,
     enabled: connection === "connected",
   });
-  const machineName = statusQuery.data?.machineName;
-  const computerName = hasPairedSession
-    ? (machineName ?? connectedComputerName(serverUrl))
-    : "No paired computer";
+  const computerName = pairedHostDisplayName(activeHost);
   const [appVersion] = useState(
     () => HotUpdater.getAppVersion() ?? Constants.expoConfig?.version ?? "1.0.0",
   );
@@ -188,7 +202,7 @@ export default function SettingsScreen() {
     }
 
     setPushNotificationsLoading(true);
-    void getPushNotificationSettings()
+    void getPushNotificationSettings(activeHostId)
       .then((settings) => {
         if (isActive) {
           setPushNotificationPreferences(settings.preferences);
@@ -210,7 +224,7 @@ export default function SettingsScreen() {
     return () => {
       isActive = false;
     };
-  }, [hasPairedSession, pushNotificationsSupported, serverUrl]);
+  }, [activeHostId, hasPairedSession, pushNotificationsSupported, serverUrl]);
 
   function closeSettings() {
     hapticSelection();
@@ -221,12 +235,66 @@ export default function SettingsScreen() {
     router.replace("/");
   }
 
-  function signOut() {
-    hapticWarning();
-    signOutCodexRelaySession();
-    clearServerState(queryClient);
+  function switchComputer(hostId: string) {
+    if (hostId === activeHostId) {
+      return;
+    }
+    hapticSelection();
+    setActivePairedHost(hostId);
     resetChatSessionState();
+    setConnection("checking");
     router.replace("/");
+  }
+
+  function removeComputerLocally(hostId: string) {
+    if (hostId !== activeHostId) {
+      setActivePairedHost(hostId);
+    }
+    removeChatHostLocalState(hostId);
+    removePinnedThreadHostState(hostId);
+    removeWorkspacePreviewHostState(hostId);
+    removeCachedWorkspaceRuntimePreferencesForHost(hostId);
+    signOutCodexRelaySession();
+    clearServerState(queryClient, hostId);
+    resetChatSessionState();
+    setConnection(hasPairedHostSession() ? "checking" : "offline");
+    router.replace("/");
+  }
+
+  function removeActiveComputer() {
+    if (!activeHostId || !activeHost) {
+      return;
+    }
+    hapticWarning();
+    Alert.alert(
+      `Remove ${pairedHostDisplayName(activeHost)}?`,
+      "This will revoke this phone’s session on the computer and remove its local pairing data.",
+      [
+        { style: "cancel", text: "Cancel" },
+        {
+          style: "destructive",
+          text: "Remove",
+          onPress: () => {
+            void revokeCodexRelaySession(activeHostId)
+              .then(() => removeComputerLocally(activeHostId))
+              .catch((caught) => {
+                Alert.alert(
+                  "Couldn’t revoke remotely",
+                  `${settingsErrorMessage(caught)}\n\nRemoving locally may leave this session valid on an older or offline relay.`,
+                  [
+                    { style: "cancel", text: "Keep Pairing" },
+                    {
+                      style: "destructive",
+                      text: "Remove Locally",
+                      onPress: () => removeComputerLocally(activeHostId),
+                    },
+                  ],
+                );
+              });
+          },
+        },
+      ],
+    );
   }
 
   async function updatePushNotificationPreference(
@@ -244,10 +312,13 @@ export default function SettingsScreen() {
     setPushNotificationsUpdating(true);
 
     try {
-      const settings = await registerPushNotifications({
-        ...(await getApnsPushRegistration()),
-        preferences: nextPreferences,
-      });
+      const settings = await registerPushNotifications(
+        {
+          ...(await getApnsPushRegistration()),
+          preferences: nextPreferences,
+        },
+        activeHostId,
+      );
       setPushNotificationPreferences(settings.preferences);
       setPushNotificationHealth(settings.health);
     } catch (caught) {
@@ -266,7 +337,7 @@ export default function SettingsScreen() {
     hapticSelection();
     setPushNotificationsUpdating(true);
     try {
-      const result = await sendTestPushNotification();
+      const result = await sendTestPushNotification(activeHostId);
       setPushNotificationHealth(result.health);
       Alert.alert(
         result.accepted ? "Test notification sent" : "Test notification pending",
@@ -277,7 +348,7 @@ export default function SettingsScreen() {
     } catch (caught) {
       hapticWarning();
       Alert.alert("Test notification failed", settingsErrorMessage(caught));
-      void getPushNotificationSettings().then((settings) => {
+      void getPushNotificationSettings(activeHostId).then((settings) => {
         setPushNotificationHealth(settings.health);
       });
     } finally {
@@ -292,10 +363,9 @@ export default function SettingsScreen() {
 
     hapticSelection();
     setSwitchingServerUrl(candidate.url);
-    const normalizedServerUrl = setCodexRelayServerUrl(candidate.url);
-    setServerUrl(normalizedServerUrl);
+    setCodexRelayServerUrl(candidate.url);
     setServerUrlCandidates(getCodexRelayServerUrlCandidates());
-    clearServerState(queryClient);
+    clearServerState(queryClient, activeHostId);
     setConnection("checking");
 
     try {
@@ -369,7 +439,7 @@ export default function SettingsScreen() {
               Settings
             </ThemedText>
             <ThemedText type="code" themeColor="textSecondary" style={styles.subtitle}>
-              Account
+              Paired Computers
             </ThemedText>
           </View>
           <View style={styles.headerButtonPlaceholder} />
@@ -481,7 +551,81 @@ export default function SettingsScreen() {
 
           <Animated.View layout={settingsLayoutTransition} style={styles.section}>
             <ThemedText type="small" themeColor="textSecondary" style={styles.sectionLabel}>
-              Connected Computer
+              Paired Computers
+            </ThemedText>
+            <Animated.View layout={settingsLayoutTransition} style={styles.connectionPanel}>
+              <View style={styles.serverAddressList}>
+                {pairedHosts.map((host) => {
+                  const isSelected = host.id === activeHostId;
+                  return (
+                    <Pressable
+                      key={host.id}
+                      accessibilityRole="button"
+                      accessibilityLabel={`Switch to ${pairedHostDisplayName(host)}`}
+                      accessibilityState={{ selected: isSelected }}
+                      onPress={() => switchComputer(host.id)}
+                      style={({ pressed }) => [
+                        styles.serverAddressRow,
+                        isSelected && styles.serverAddressRowSelected,
+                        pressed && styles.pressed,
+                      ]}
+                    >
+                      <View style={styles.serverAddressCopy}>
+                        <ThemedText type="smallBold" style={styles.serverAddressLabel}>
+                          {pairedHostDisplayName(host)}
+                        </ThemedText>
+                        <ThemedText
+                          type="code"
+                          themeColor="textSecondary"
+                          style={styles.serverAddressValue}
+                          numberOfLines={1}
+                        >
+                          {host.requiresRepair
+                            ? `PAIR AGAIN · ${compactServer(host.activeUrl)}`
+                            : compactServer(host.activeUrl)}
+                        </ThemedText>
+                      </View>
+                      <View
+                        style={[
+                          styles.serverAddressStatus,
+                          isSelected && styles.serverAddressStatusSelected,
+                        ]}
+                      >
+                        <ThemedText
+                          type="code"
+                          style={[
+                            styles.serverAddressStatusText,
+                            isSelected && styles.serverAddressStatusTextSelected,
+                          ]}
+                        >
+                          {isSelected ? "ACTIVE" : "SWITCH"}
+                        </ThemedText>
+                      </View>
+                    </Pressable>
+                  );
+                })}
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel="Pair another computer"
+                  onPress={() => router.push("/pair")}
+                  style={({ pressed }) => [styles.signOutRow, pressed && styles.pressed]}
+                >
+                  <View style={styles.signOutContent}>
+                    <View style={styles.signOutIconSlot}>
+                      <Icon name="newThread" size={17} tintColor={Colors.dark.text} />
+                    </View>
+                    <View style={styles.signOutCopy}>
+                      <ThemedText type="smallBold">Pair another computer</ThemedText>
+                    </View>
+                  </View>
+                </Pressable>
+              </View>
+            </Animated.View>
+          </Animated.View>
+
+          <Animated.View layout={settingsLayoutTransition} style={styles.section}>
+            <ThemedText type="small" themeColor="textSecondary" style={styles.sectionLabel}>
+              Active Computer
             </ThemedText>
             <Animated.View layout={settingsLayoutTransition} style={styles.connectionPanel}>
               <Animated.View layout={settingsFastLayoutTransition} style={styles.connectionHeader}>
@@ -661,8 +805,26 @@ export default function SettingsScreen() {
               </ThemedText>
               <Pressable
                 accessibilityRole="button"
-                accessibilityLabel="Sign out"
-                onPress={signOut}
+                accessibilityLabel="Pair active computer again"
+                onPress={() => router.push("/pair")}
+                style={({ pressed }) => [styles.signOutRow, pressed && styles.pressed]}
+              >
+                <View style={styles.signOutContent}>
+                  <View style={styles.signOutIconSlot}>
+                    <Icon name="refresh" size={17} tintColor={Colors.dark.text} />
+                  </View>
+                  <View style={styles.signOutCopy}>
+                    <ThemedText type="smallBold">Pair again</ThemedText>
+                    <ThemedText type="small" themeColor="textSecondary">
+                      Replace this computer’s token and encryption session
+                    </ThemedText>
+                  </View>
+                </View>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Remove active computer"
+                onPress={removeActiveComputer}
                 style={({ pressed }) => [styles.signOutRow, pressed && styles.pressed]}
               >
                 <View style={styles.signOutContent}>
@@ -671,14 +833,14 @@ export default function SettingsScreen() {
                   </View>
                   <View style={styles.signOutCopy}>
                     <ThemedText type="smallBold" style={styles.signOutTitle}>
-                      Sign out
+                      Remove computer
                     </ThemedText>
                     <ThemedText
                       type="small"
                       themeColor="textSecondary"
                       style={styles.signOutSubtitle}
                     >
-                      Pair again on this device
+                      Revoke this phone and delete local pairing data
                     </ThemedText>
                   </View>
                 </View>
@@ -980,18 +1142,6 @@ function InfoLine({
       </ThemedText>
     </Animated.View>
   );
-}
-
-function connectedComputerName(serverUrl: string) {
-  if (!serverUrl) {
-    return "No computer paired";
-  }
-
-  try {
-    return new URL(serverUrl).hostname;
-  } catch {
-    return compactServer(serverUrl);
-  }
 }
 
 function compactServer(serverUrl: string) {

@@ -1,6 +1,6 @@
 import { vi } from "vitest";
 
-const stores = new Map<string, Map<string, string>>();
+const stores = new Map<string, Map<string, string | number>>();
 
 vi.mock("react-native-mmkv", () => ({
   createMMKV(options?: { id?: string }) {
@@ -12,13 +12,21 @@ vi.mock("react-native-mmkv", () => ({
     }
 
     return {
+      getAllKeys() {
+        return [...store.keys()];
+      },
       getString(key: string) {
-        return store.get(key);
+        const value = store.get(key);
+        return typeof value === "string" ? value : undefined;
+      },
+      getNumber(key: string) {
+        const value = store.get(key);
+        return typeof value === "number" ? value : undefined;
       },
       remove(key: string) {
         store.delete(key);
       },
-      set(key: string, value: string) {
+      set(key: string, value: string | number) {
         store.set(key, value);
       },
     };

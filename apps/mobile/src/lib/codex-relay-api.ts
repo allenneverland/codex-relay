@@ -43,6 +43,7 @@ import {
   WorkspaceTerminalOutputResponseSchema,
   WorkspaceTerminalSessionResponseSchema,
   apiPaths,
+  relayIdFromServerPublicKey,
   type ArchiveThreadResponse,
   type CheckoutWorkspaceBranchRequest,
   type CommitPushWorkspaceRequest,
@@ -101,6 +102,7 @@ import {
   createSecurePairingAttempt,
   decryptResponsePayload,
   encryptRequestPayload,
+  persistSecureSession,
 } from "./secure-transport";
 import { startPairingTrialIfNeeded } from "./pairing-trial";
 import {
@@ -110,7 +112,6 @@ import {
 } from "./thread-run-stream";
 import { requestWithNetworkTimeout, withTimeout } from "./network-timeout";
 import {
-  clearCodexRelayServerUrlState,
   codexRelayStorage as storage,
   dedupeServerUrls,
   fallbackCodexRelayServerUrl,
@@ -120,16 +121,22 @@ import {
   isLocalIPv6Host,
   isPrivateIPv4Host,
   normalizeServerUrl,
-  saveCodexRelayServerUrlCandidates,
   setCodexRelayServerUrl,
   type CodexRelayServerUrlCandidate,
 } from "./codex-relay-server-url-storage";
+import {
+  getActiveHostId,
+  getHostClientToken,
+  getPairedHost,
+  hasPairedHostSession,
+  markPairedHostRequiresRepair,
+  removePairedHostRecord,
+  upsertPairedHost,
+} from "@/state/paired-host-store";
 
 const skillsPath = "/v1/skills";
 const skillsRequestTimeoutMs = 8000;
 const clientSessionIdStorageKey = "codex-relay.client-session-id";
-const legacyClientTokenExpiresAtStorageKey = "codex-relay.client-token-expires-at";
-const clientTokenStorageKey = "codex-relay.client-token";
 const pairingConnectTimeoutMs = 2500;
 const streamRequestTimeoutMs = 10 * 60 * 1000;
 const terminalStreamRequestTimeoutMs = 24 * 60 * 60 * 1000;
@@ -139,9 +146,16 @@ type NetworkRequestInit = RequestInit & {
 };
 
 type PairingQrPayload = {
+  relayId: string;
   serverPublicKey: string;
   serverUrl: string;
   serverUrls: string[];
+};
+
+type RelayRequestContext = {
+  hostId?: string;
+  serverUrl: string;
+  token?: string;
 };
 
 export {
@@ -198,26 +212,28 @@ export function resolveCodexRelayImageUrl(url: string) {
 }
 
 export function codexRelayImageRequestHeaders() {
+  const context = captureRelayRequestContext();
   const headers: Record<string, string> = {
     accept: "image/*",
     "x-codex-relay-client-session-id": getClientSessionId(),
   };
-  const clientToken = storage.getString(clientTokenStorageKey);
-  if (clientToken) {
-    headers.authorization = `Bearer ${clientToken}`;
+  if (context.token) {
+    headers.authorization = `Bearer ${context.token}`;
   }
   return headers;
 }
 
 export function signOutCodexRelaySession() {
-  storage.remove(clientTokenStorageKey);
-  storage.remove(legacyClientTokenExpiresAtStorageKey);
-  clearSecureSession();
-  clearCodexRelayServerUrlState();
+  const hostId = getActiveHostId();
+  if (!hostId) {
+    return undefined;
+  }
+  clearSecureSession(hostId);
+  return removePairedHostRecord(hostId);
 }
 
-export function hasCodexRelaySession() {
-  return Boolean(storage.getString(clientTokenStorageKey));
+export function hasCodexRelaySession(hostId = getActiveHostId()) {
+  return hasPairedHostSession(hostId);
 }
 
 export async function pairWithQrPayload(
@@ -230,9 +246,17 @@ export async function pairWithQrPayload(
   for (const serverUrl of pairingPayload.serverUrls) {
     try {
       const paired = await pairWithApproval(serverUrl, pairingPayload.serverPublicKey, handlers);
-      saveCodexRelayServerUrlCandidates([paired.serverUrl, ...pairingPayload.serverUrls]);
+      const host = upsertPairedHost({
+        clientToken: paired.clientToken,
+        relayId: pairingPayload.relayId,
+        serverUrl: paired.serverUrl,
+        serverUrls: pairingPayload.serverUrls,
+      });
+      persistSecureSession(host.id, paired.secureSession);
+      await startPairingTrialIfNeeded();
       return {
         ...pairingPayload,
+        hostId: host.id,
         serverUrl: paired.serverUrl,
       };
     } catch (error) {
@@ -293,10 +317,13 @@ async function pairWithApproval(
   attachApprovalCode(securePairing, parsed.approvalCode);
   handlers?.onApprovalCode?.(parsed.approvalCode, normalizedServerUrl);
   const approved = await waitForPairingApproval(normalizedServerUrl, parsed.approvalCode);
-  const session = completeSecurePairing(securePairing, approved);
-  saveSession(normalizedServerUrl, session.clientToken);
-  await startPairingTrialIfNeeded();
-  return { approvalCode: parsed.approvalCode, serverUrl: normalizedServerUrl };
+  const completed = completeSecurePairing(securePairing, approved);
+  return {
+    approvalCode: parsed.approvalCode,
+    clientToken: completed.payload.clientToken,
+    secureSession: completed.session,
+    serverUrl: normalizedServerUrl,
+  };
 }
 
 async function waitForPairingApproval(serverUrl: string, approvalCode: string) {
@@ -403,7 +430,6 @@ function isLocalhostUrl(url: string) {
 }
 
 export async function refreshSession() {
-  storage.remove(legacyClientTokenExpiresAtStorageKey);
   return hasCodexRelaySession();
 }
 
@@ -436,6 +462,7 @@ function parsePairingQrPayload(payload: unknown): PairingQrPayload {
   }
 
   return {
+    relayId: relayIdFromServerPublicKey(serverPublicKey),
     serverPublicKey,
     serverUrl: normalizedServerUrl,
     serverUrls: parsePairingServerUrls(parsed, normalizedServerUrl),
@@ -492,66 +519,86 @@ function pairingCandidateFailureMessage(errors: PairingCandidateConnectionError[
     : "Could not reach the server URL from the pairing QR.";
 }
 
-export async function getStatus(): Promise<StatusResponse> {
-  return request(apiPaths.status, undefined, StatusResponseSchema.parse);
+export async function getStatus(hostId?: string): Promise<StatusResponse> {
+  return request(apiPaths.status, undefined, StatusResponseSchema.parse, { hostId });
 }
 
-export async function getVersion(): Promise<VersionResponse> {
-  return request(apiPaths.version, undefined, VersionResponseSchema.parse);
+export async function getVersion(hostId?: string): Promise<VersionResponse> {
+  return request(apiPaths.version, undefined, VersionResponseSchema.parse, { hostId });
 }
 
 export async function updateRuntimePreferences(
   body: UpdateRuntimePreferencesRequest,
+  hostId = getActiveHostId(),
 ): Promise<RuntimePreferencesResponse> {
   return request(
     apiPaths.preferences,
     {
       method: "PATCH",
-      body: encryptRequestPayload(UpdateRuntimePreferencesRequestSchema.parse(body)),
+      body: encryptRequestPayload(UpdateRuntimePreferencesRequestSchema.parse(body), hostId),
     },
     RuntimePreferencesResponseSchema.parse,
+    { hostId },
   );
 }
 
-export async function getPushNotificationSettings(): Promise<PushNotificationSettingsResponse> {
+export async function getPushNotificationSettings(
+  hostId?: string,
+): Promise<PushNotificationSettingsResponse> {
   return request(
     apiPaths.pushNotifications,
     undefined,
     PushNotificationSettingsResponseSchema.parse,
+    { hostId },
   );
 }
 
 export async function registerPushNotifications(
   body: RegisterPushNotificationRequest,
+  hostId = getActiveHostId(),
 ): Promise<PushNotificationSettingsResponse> {
   return request(
     apiPaths.pushNotifications,
     {
-      body: encryptRequestPayload(RegisterPushNotificationRequestSchema.parse(body)),
+      body: encryptRequestPayload(RegisterPushNotificationRequestSchema.parse(body), hostId),
       method: "PUT",
     },
     PushNotificationSettingsResponseSchema.parse,
+    { hostId },
   );
 }
 
-export async function unregisterPushNotifications(): Promise<PushNotificationSettingsResponse> {
+export async function unregisterPushNotifications(
+  hostId?: string,
+): Promise<PushNotificationSettingsResponse> {
   return request(
     apiPaths.pushNotifications,
     { method: "DELETE" },
     PushNotificationSettingsResponseSchema.parse,
+    { hostId },
   );
 }
 
-export async function sendTestPushNotification(): Promise<PushNotificationTestResponse> {
+export async function sendTestPushNotification(
+  hostId?: string,
+): Promise<PushNotificationTestResponse> {
   return request(
     apiPaths.pushNotificationsTest,
     { method: "POST" },
     PushNotificationTestResponseSchema.parse,
+    { hostId },
   );
 }
 
-export async function listThreads(): Promise<ListThreadsResponse> {
-  return request(apiPaths.threads, undefined, ListThreadsResponseSchema.parse);
+export async function revokeCodexRelaySession(hostId = getActiveHostId()) {
+  if (!hostId) {
+    return;
+  }
+  await requestNoContent(apiPaths.session, { method: "DELETE" }, hostId);
+}
+
+export async function listThreads(hostId?: string): Promise<ListThreadsResponse> {
+  return request(apiPaths.threads, undefined, ListThreadsResponseSchema.parse, { hostId });
 }
 
 export async function archiveThread(threadId: string): Promise<ArchiveThreadResponse> {
@@ -576,20 +623,24 @@ export async function renameThread(
   );
 }
 
-export async function listModels(): Promise<ListModelsResponse> {
-  return request(apiPaths.models, undefined, ListModelsResponseSchema.parse);
+export async function listModels(hostId?: string): Promise<ListModelsResponse> {
+  return request(apiPaths.models, undefined, ListModelsResponseSchema.parse, { hostId });
 }
 
-export async function listSkills(workspacePath?: string): Promise<ListSkillsResponse> {
+export async function listSkills(
+  workspacePath?: string,
+  hostId?: string,
+): Promise<ListSkillsResponse> {
   const query = workspacePath ? `?workspacePath=${encodeURIComponent(workspacePath)}` : "";
   return withTimeout(
-    request(`${skillsPath}${query}`, undefined, ListSkillsResponseSchema.parse),
+    request(`${skillsPath}${query}`, undefined, ListSkillsResponseSchema.parse, { hostId }),
     skillsRequestTimeoutMs,
   );
 }
 
 export async function listWorkspaceFiles(
   input: { directory?: string; query?: string; workspacePath?: string } = {},
+  hostId?: string,
 ): Promise<ListWorkspaceFilesResponse> {
   const params = new URLSearchParams();
   if (input.directory) {
@@ -606,13 +657,17 @@ export async function listWorkspaceFiles(
     `${apiPaths.workspaceFiles}${query ? `?${query}` : ""}`,
     undefined,
     ListWorkspaceFilesResponseSchema.parse,
+    { hostId },
   );
 }
 
-export async function getWorkspaceFileContent(input: {
-  path: string;
-  workspacePath?: string;
-}): Promise<WorkspaceFileContentResponse> {
+export async function getWorkspaceFileContent(
+  input: {
+    path: string;
+    workspacePath?: string;
+  },
+  hostId?: string,
+): Promise<WorkspaceFileContentResponse> {
   const params = new URLSearchParams();
   params.set("path", input.path);
   if (input.workspacePath) {
@@ -622,35 +677,41 @@ export async function getWorkspaceFileContent(input: {
     `${apiPaths.workspaceFileContent}?${params.toString()}`,
     undefined,
     WorkspaceFileContentResponseSchema.parse,
+    { hostId },
   );
 }
 
 export async function updateWorkspaceFileContent(
   body: UpdateWorkspaceFileContentRequest,
+  hostId = getActiveHostId(),
 ): Promise<WorkspaceFileContentResponse> {
   return request(
     apiPaths.workspaceFileContent,
     {
-      body: encryptRequestPayload(UpdateWorkspaceFileContentRequestSchema.parse(body)),
+      body: encryptRequestPayload(UpdateWorkspaceFileContentRequestSchema.parse(body), hostId),
       method: "PUT",
     },
     WorkspaceFileContentResponseSchema.parse,
+    { hostId },
   );
 }
 
 export async function listWorkspaceDirectories(
   path?: string,
+  hostId?: string,
 ): Promise<ListWorkspaceDirectoriesResponse> {
   const query = path ? `?path=${encodeURIComponent(path)}` : "";
   return request(
     `${apiPaths.workspaceDirectories}${query}`,
     undefined,
     ListWorkspaceDirectoriesResponseSchema.parse,
+    { hostId },
   );
 }
 
 export async function getWorkspaceChanges(
   input?: WorkspaceSelectionRequest,
+  hostId?: string,
 ): Promise<WorkspaceChangesResponse> {
   const workspacePath = input?.workspacePath?.trim();
   const query = workspacePath ? `?workspacePath=${encodeURIComponent(workspacePath)}` : "";
@@ -658,6 +719,7 @@ export async function getWorkspaceChanges(
     `${apiPaths.workspaceChanges}${query}`,
     undefined,
     WorkspaceChangesResponseSchema.parse,
+    { hostId },
   );
 }
 
@@ -734,11 +796,12 @@ export function streamWorkspaceTerminalOutput(
     onError: (error: Error) => void;
   },
 ) {
+  const context = captureRelayRequestContext();
   const requestUrl =
-    `${getCodexRelayServerUrl()}${apiPaths.workspaceTerminalOutputStream(sessionId)}` +
+    `${context.serverUrl}${apiPaths.workspaceTerminalOutputStream(sessionId)}` +
     `?since=${encodeURIComponent(String(since))}`;
   let closed = false;
-  const dispatcher = createTerminalOutputSseDispatcher(handlers);
+  const dispatcher = createTerminalOutputSseDispatcher(handlers, context.hostId);
 
   function fail(error: Error) {
     if (closed) {
@@ -752,7 +815,7 @@ export function streamWorkspaceTerminalOutput(
     requestUrl,
     {
       method: "GET",
-      headers: streamRequestHeaders({ jsonContentType: false }),
+      headers: streamRequestHeaders({ jsonContentType: false }, context),
       timeoutMs: terminalStreamRequestTimeoutMs,
     },
     (text) => {
@@ -766,10 +829,11 @@ export function streamWorkspaceTerminalOutput(
         return;
       }
       if (!response.ok) {
+        markRepairIfUnauthorized(response.status, context.hostId);
         void response.text().then((text) => {
           let payload: unknown = text;
           try {
-            payload = decryptResponsePayload(JSON.parse(text));
+            payload = decryptResponsePayload(JSON.parse(text), context.hostId);
           } catch {}
           fail(new Error(errorMessage(payload, `Codex Relay server returned ${response.status}`)));
         });
@@ -788,10 +852,13 @@ export function streamWorkspaceTerminalOutput(
   };
 }
 
-function createTerminalOutputSseDispatcher(handlers: {
-  onOutput: (response: WorkspaceTerminalOutputResponse) => void;
-  onError: (error: Error) => void;
-}) {
+function createTerminalOutputSseDispatcher(
+  handlers: {
+    onOutput: (response: WorkspaceTerminalOutputResponse) => void;
+    onError: (error: Error) => void;
+  },
+  hostId: string | undefined,
+) {
   let pendingChunk = "";
   let closed = false;
 
@@ -804,7 +871,7 @@ function createTerminalOutputSseDispatcher(handlers: {
       const parts = pendingChunk.split(/\r?\n\r?\n/);
       pendingChunk = parts.pop() ?? "";
       for (const part of parts) {
-        if (!dispatchTerminalOutputSseChunk(part, handlers)) {
+        if (!dispatchTerminalOutputSseChunk(part, handlers, hostId)) {
           closed = true;
           return false;
         }
@@ -815,7 +882,7 @@ function createTerminalOutputSseDispatcher(handlers: {
       if (closed) {
         return false;
       }
-      if (pendingChunk.trim() && !dispatchTerminalOutputSseChunk(pendingChunk, handlers)) {
+      if (pendingChunk.trim() && !dispatchTerminalOutputSseChunk(pendingChunk, handlers, hostId)) {
         closed = true;
         return false;
       }
@@ -831,6 +898,7 @@ function dispatchTerminalOutputSseChunk(
     onOutput: (response: WorkspaceTerminalOutputResponse) => void;
     onError: (error: Error) => void;
   },
+  hostId: string | undefined,
 ) {
   const data = chunk
     .split(/\r?\n/)
@@ -846,7 +914,7 @@ function dispatchTerminalOutputSseChunk(
   }
 
   try {
-    const payload = decryptResponsePayload(JSON.parse(data));
+    const payload = decryptResponsePayload(JSON.parse(data), hostId);
     handlers.onOutput(WorkspaceTerminalOutputResponseSchema.parse(payload));
     return true;
   } catch {
@@ -884,9 +952,10 @@ export async function closeWorkspaceTerminalSession(sessionId: string) {
   return { ok: true };
 }
 
-async function requestNoContent(path: string, init: RequestInit) {
-  const headers = requestHeaders(init.headers);
-  const serverRequestUrl = `${getCodexRelayServerUrl()}${path}`;
+async function requestNoContent(path: string, init: RequestInit, hostId?: string) {
+  const context = captureRelayRequestContext(hostId);
+  const headers = requestHeaders(init.headers, {}, context);
+  const serverRequestUrl = `${context.serverUrl}${path}`;
   const response = await fetchWithNetworkContext(serverRequestUrl, {
     ...init,
     headers,
@@ -895,23 +964,29 @@ async function requestNoContent(path: string, init: RequestInit) {
     return;
   }
 
-  const payload = decryptResponsePayload(await response.json().catch(() => undefined));
+  markRepairIfUnauthorized(response.status, context.hostId);
+
+  const payload = decryptResponsePayload(
+    await response.json().catch(() => undefined),
+    context.hostId,
+  );
   const message = errorMessage(payload, `Codex Relay server returned ${response.status}`);
   throw new CodexRelayApiError(message, response.status, errorCode(payload));
 }
 
-export async function getRateLimits(): Promise<RateLimitsResponse> {
-  return request(apiPaths.rateLimits, undefined, RateLimitsResponseSchema.parse);
+export async function getRateLimits(hostId?: string): Promise<RateLimitsResponse> {
+  return request(apiPaths.rateLimits, undefined, RateLimitsResponseSchema.parse, { hostId });
 }
 
 export async function getThread(
   threadId: string,
   options: { refresh?: boolean } = {},
+  hostId?: string,
 ): Promise<ThreadDetailResponse> {
   const path = options.refresh
     ? `${apiPaths.thread(threadId)}?refresh=true`
     : apiPaths.thread(threadId);
-  return request(path, undefined, ThreadDetailResponseSchema.parse);
+  return request(path, undefined, ThreadDetailResponseSchema.parse, { hostId });
 }
 
 export async function rewindThread(
@@ -942,39 +1017,52 @@ export async function getThreadMessageDetail(
 
 export async function getThreadContextWindow(
   threadId: string,
+  hostId?: string,
 ): Promise<ThreadContextWindowResponse> {
   return request(
     apiPaths.threadContextWindow(threadId),
     undefined,
     ThreadContextWindowResponseSchema.parse,
+    { hostId },
   );
 }
 
-export async function getThreadGoal(threadId: string): Promise<ThreadGoalResponse> {
-  return request(apiPaths.threadGoal(threadId), undefined, ThreadGoalResponseSchema.parse);
+export async function getThreadGoal(
+  threadId: string,
+  hostId?: string,
+): Promise<ThreadGoalResponse> {
+  return request(apiPaths.threadGoal(threadId), undefined, ThreadGoalResponseSchema.parse, {
+    hostId,
+  });
 }
 
 export async function updateThreadGoal(
   threadId: string,
   body: UpdateThreadGoalRequest,
+  hostId = getActiveHostId(),
 ): Promise<ThreadGoalResponse> {
   return request(
     apiPaths.threadGoal(threadId),
     {
       method: "POST",
-      body: encryptRequestPayload(UpdateThreadGoalRequestSchema.parse(body)),
+      body: encryptRequestPayload(UpdateThreadGoalRequestSchema.parse(body), hostId),
     },
     ThreadGoalResponseSchema.parse,
+    { hostId },
   );
 }
 
-export async function clearThreadGoal(threadId: string): Promise<ThreadGoalResponse> {
+export async function clearThreadGoal(
+  threadId: string,
+  hostId?: string,
+): Promise<ThreadGoalResponse> {
   return request(
     apiPaths.threadGoal(threadId),
     {
       method: "DELETE",
     },
     ThreadGoalResponseSchema.parse,
+    { hostId },
   );
 }
 
@@ -998,17 +1086,18 @@ export function streamThreadRun(
     onClose?: () => void;
   },
 ) {
-  const requestUrl = `${getCodexRelayServerUrl()}${apiPaths.threadRunStream(threadId)}`;
-  const requestBody = encryptRequestPayload(body);
+  const context = captureRelayRequestContext();
+  const requestUrl = `${context.serverUrl}${apiPaths.threadRunStream(threadId)}`;
+  const requestBody = encryptRequestPayload(body, context.hostId);
   if (shouldUseDirectFetch(requestUrl, { body: requestBody })) {
-    return streamThreadRunWithDirectFetch(requestUrl, requestBody, handlers);
+    return streamThreadRunWithDirectFetch(requestUrl, requestBody, handlers, context);
   }
 
   const source = new EventSource<StreamThreadRunEvent["type"]>(requestUrl, {
     method: "POST",
     headers: {
       accept: "text/event-stream",
-      ...authorizationHeader(),
+      ...authorizationHeader(context),
       "content-type": "application/json",
     },
     body: requestBody,
@@ -1022,7 +1111,11 @@ export function streamThreadRun(
       }
 
       try {
-        handlers.onEvent(parseThreadRunStreamPayload(event.data, decryptResponsePayload));
+        handlers.onEvent(
+          parseThreadRunStreamPayload(event.data, (payload) =>
+            decryptResponsePayload(payload, context.hostId),
+          ),
+        );
       } catch {
         handlers.onError(new Error("Codex Relay server returned an invalid stream event."));
       }
@@ -1050,9 +1143,12 @@ function streamThreadRunWithDirectFetch(
     onError: (error: Error) => void;
     onClose?: () => void;
   },
+  context: RelayRequestContext,
 ) {
   let closed = false;
-  const dispatcher = createThreadRunSseDispatcher(handlers, decryptResponsePayload);
+  const dispatcher = createThreadRunSseDispatcher(handlers, (payload) =>
+    decryptResponsePayload(payload, context.hostId),
+  );
 
   function close() {
     if (closed) {
@@ -1083,7 +1179,7 @@ function streamThreadRunWithDirectFetch(
     requestUrl,
     {
       method: "POST",
-      headers: streamRequestHeaders(),
+      headers: streamRequestHeaders({}, context),
       body: requestBody,
       timeoutMs: streamRequestTimeoutMs,
     },
@@ -1094,10 +1190,11 @@ function streamThreadRunWithDirectFetch(
         return;
       }
       if (!response.ok) {
+        markRepairIfUnauthorized(response.status, context.hostId);
         void response.text().then((text) => {
           let payload: unknown = text;
           try {
-            payload = decryptResponsePayload(JSON.parse(text));
+            payload = decryptResponsePayload(JSON.parse(text), context.hostId);
           } catch {}
           fail(new Error(errorMessage(payload, `Codex Relay server returned ${response.status}`)));
         });
@@ -1118,14 +1215,17 @@ function streamThreadRunWithDirectFetch(
   };
 }
 
-function streamRequestHeaders(options: { jsonContentType?: boolean } = {}) {
+function streamRequestHeaders(
+  options: { jsonContentType?: boolean } = {},
+  context = captureRelayRequestContext(),
+) {
   const headers = new Headers({
     accept: "text/event-stream",
   });
   if (options.jsonContentType !== false) {
     headers.set("content-type", "application/json");
   }
-  const authorization = authorizationHeader().authorization;
+  const authorization = authorizationHeader(context).authorization;
   if (authorization) {
     headers.set("authorization", authorization);
   }
@@ -1195,11 +1295,13 @@ export async function interruptThreadRun(threadId: string) {
 
 export async function listQueuedThreadInputs(
   threadId: string,
+  hostId?: string,
 ): Promise<ListQueuedThreadInputsResponse> {
   return request(
     apiPaths.threadInput(threadId),
     undefined,
     ListQueuedThreadInputsResponseSchema.parse,
+    { hostId },
   );
 }
 
@@ -1254,17 +1356,22 @@ async function request<T>(
   path: string,
   init: RequestInit | undefined,
   parse: (payload: unknown) => T,
-  options?: { jsonContentType?: boolean },
+  options: { hostId?: string; jsonContentType?: boolean } = {},
 ) {
-  const headers = requestHeaders(init?.headers, options);
-  const serverRequestUrl = `${getCodexRelayServerUrl()}${path}`;
+  const context = captureRelayRequestContext(options.hostId);
+  const headers = requestHeaders(init?.headers, options, context);
+  const serverRequestUrl = `${context.serverUrl}${path}`;
   const response = await fetchWithNetworkContext(serverRequestUrl, {
     ...init,
     headers,
   });
-  const payload = decryptResponsePayload(await response.json().catch(() => undefined));
+  const payload = decryptResponsePayload(
+    await response.json().catch(() => undefined),
+    context.hostId,
+  );
 
   if (!response.ok) {
+    markRepairIfUnauthorized(response.status, context.hostId);
     const message = errorMessage(payload, `Codex Relay server returned ${response.status}`);
     throw new CodexRelayApiError(message, response.status, errorCode(payload));
   }
@@ -1272,9 +1379,16 @@ async function request<T>(
   return parse(payload);
 }
 
+function markRepairIfUnauthorized(status: number, hostId: string | undefined) {
+  if (status === 401 && hostId) {
+    markPairedHostRequiresRepair(hostId);
+  }
+}
+
 function requestHeaders(
   initHeaders: HeadersInit | undefined,
   options: { jsonContentType?: boolean } = {},
+  context = captureRelayRequestContext(),
 ) {
   const headers = new Headers({
     accept: "application/json",
@@ -1286,9 +1400,8 @@ function requestHeaders(
     headers.set(key, value);
   }
 
-  const clientToken = storage.getString(clientTokenStorageKey);
-  if (clientToken && !headers.has("authorization")) {
-    headers.set("authorization", `Bearer ${clientToken}`);
+  if (context.token && !headers.has("authorization")) {
+    headers.set("authorization", `Bearer ${context.token}`);
   }
   if (!headers.has("x-codex-relay-client-session-id")) {
     headers.set("x-codex-relay-client-session-id", getClientSessionId());
@@ -1297,10 +1410,13 @@ function requestHeaders(
   return headers;
 }
 
-function saveSession(serverUrl: string, clientToken: string) {
-  setCodexRelayServerUrl(serverUrl);
-  storage.set(clientTokenStorageKey, clientToken);
-  storage.remove(legacyClientTokenExpiresAtStorageKey);
+function captureRelayRequestContext(hostId = getActiveHostId()): RelayRequestContext {
+  const host = getPairedHost(hostId);
+  return {
+    hostId: host?.id,
+    serverUrl: host?.activeUrl ?? fallbackCodexRelayServerUrl,
+    token: getHostClientToken(host?.id),
+  };
 }
 
 export function getClientSessionId() {
@@ -1325,9 +1441,8 @@ function createUuidV4() {
     .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10, 16).join("")}`;
 }
 
-function authorizationHeader() {
-  const clientToken = storage.getString(clientTokenStorageKey);
-  return clientToken ? { authorization: `Bearer ${clientToken}` } : {};
+function authorizationHeader(context = captureRelayRequestContext()) {
+  return context.token ? { authorization: `Bearer ${context.token}` } : {};
 }
 
 function sleep(ms: number) {

@@ -1,6 +1,7 @@
 import { WORKSPACE_PREVIEW_TAB_VALUES, type WorkspacePreviewTab } from "codex-relay/api-schema";
 import { observable } from "@legendapp/state";
 
+import { getActiveHostId } from "./paired-host-store";
 import { persistLocalObservable } from "./persistence";
 
 export { type WorkspacePreviewTab };
@@ -26,9 +27,11 @@ export const workspacePreviewStore$ = observable<WorkspacePreviewState>(
 );
 
 persistLocalObservable(workspacePreviewStore$, "workspace-preview");
+migrateLegacyWorkspacePreviewState(getActiveHostId());
 
 export function workspacePreviewKey(workspacePath: string | undefined) {
-  return workspacePath?.trim() || "__default_workspace__";
+  const hostId = getActiveHostId() ?? "__unpaired__";
+  return `${hostId}::${workspacePath?.trim() || "__default_workspace__"}`;
 }
 
 export function getWorkspacePreviewTabs(workspacePath: string | undefined) {
@@ -128,10 +131,49 @@ export function resetWorkspacePreviewState() {
   workspacePreviewStore$.set(createDefaultWorkspacePreviewState());
 }
 
+export function removeWorkspacePreviewHostState(hostId: string) {
+  workspacePreviewStore$.set((current) => ({
+    activeTabByWorkspacePath: withoutHostEntries(current.activeTabByWorkspacePath, hostId),
+    tabsByWorkspacePath: withoutHostEntries(current.tabsByWorkspacePath, hostId),
+    webStateByWorkspacePath: withoutHostEntries(current.webStateByWorkspacePath, hostId),
+  }));
+}
+
 function createDefaultWorkspacePreviewState(): WorkspacePreviewState {
   return {
     activeTabByWorkspacePath: {},
     tabsByWorkspacePath: {},
     webStateByWorkspacePath: {},
   };
+}
+
+function migrateLegacyWorkspacePreviewState(hostId: string | undefined) {
+  if (!hostId) {
+    return;
+  }
+  workspacePreviewStore$.set((current) => ({
+    activeTabByWorkspacePath: namespaceLegacyRecord(current.activeTabByWorkspacePath, hostId),
+    tabsByWorkspacePath: namespaceLegacyRecord(current.tabsByWorkspacePath, hostId),
+    webStateByWorkspacePath: namespaceLegacyRecord(current.webStateByWorkspacePath, hostId),
+  }));
+}
+
+function namespaceLegacyRecord<T>(record: Record<string, T>, hostId: string) {
+  let next = record;
+  for (const [key, value] of Object.entries(record)) {
+    if (key.includes("::")) {
+      continue;
+    }
+    if (next === record) {
+      next = { ...record };
+    }
+    next[`${hostId}::${key}`] = value;
+    delete next[key];
+  }
+  return next;
+}
+
+function withoutHostEntries<T>(record: Record<string, T>, hostId: string) {
+  const prefix = `${hostId}::`;
+  return Object.fromEntries(Object.entries(record).filter(([key]) => !key.startsWith(prefix)));
 }

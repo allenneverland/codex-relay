@@ -15,6 +15,7 @@ import { useTheme } from "@/hooks/use-theme";
 import { getThreadMessageDetail, resolveApproval } from "@/lib/codex-relay-api";
 import { hapticSelection, hapticSuccess, hapticWarning } from "@/lib/haptics";
 import { markMessageApprovalResolvedState } from "@/lib/server-state";
+import { getActiveHostId } from "@/state/paired-host-store";
 
 const INLINE_PATCH_LINE_LIMIT = 48;
 
@@ -47,6 +48,7 @@ export function ProtocolActivityCard({ message }: { message: ChatMessage }) {
       return;
     }
 
+    const hostId = getActiveHostId();
     setResolving(true);
     hapticSelection();
     try {
@@ -57,7 +59,7 @@ export function ProtocolActivityCard({ message }: { message: ChatMessage }) {
         });
       }
       setResolution(decision);
-      markMessageApprovalResolvedState(queryClient, message.threadId, message.id, decision);
+      markMessageApprovalResolvedState(queryClient, message.threadId, message.id, decision, hostId);
       hapticSuccess();
     } catch (caught) {
       hapticWarning();

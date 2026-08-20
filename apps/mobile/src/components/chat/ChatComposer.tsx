@@ -54,6 +54,7 @@ import { Text } from "@/components/ui/text";
 import { Fonts } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
 import { listWorkspaceFiles } from "@/lib/codex-relay-api";
+import { relayHostIdFromQueryKey } from "@/lib/workspace-file-queries";
 import { hapticMediumImpact, hapticSelection, hapticWarning } from "@/lib/haptics";
 import { formatRateLimitRemaining, visibleRateLimitRows } from "@/lib/rate-limits";
 import {
@@ -65,6 +66,7 @@ import {
   type ComposerAttachment,
   type QueuedComposerPrompt,
 } from "@/state/chat-store";
+import { getActiveHostId } from "@/state/paired-host-store";
 
 import { PromptMarkdownText } from "./PromptMarkdownText";
 
@@ -363,8 +365,18 @@ export const ChatComposer = memo(function ChatComposer({
   const shouldFetchFileSuggestions = Boolean(fileMentionQuery !== undefined && !disabled);
   const fileSuggestionsQuery = useQuery({
     enabled: shouldFetchFileSuggestions,
-    queryFn: () => listWorkspaceFiles({ query: fileMentionQuery, workspacePath }),
-    queryKey: ["codex-relay-workspace-files", workspacePath ?? null, fileMentionQuery ?? ""],
+    queryFn: ({ queryKey }) =>
+      listWorkspaceFiles(
+        { query: fileMentionQuery, workspacePath },
+        relayHostIdFromQueryKey(queryKey),
+      ),
+    queryKey: [
+      "codex-relay",
+      getActiveHostId() ?? "__unpaired__",
+      "workspace-files",
+      workspacePath ?? null,
+      fileMentionQuery ?? "",
+    ],
     staleTime: 10_000,
   });
   const visibleFiles = fileSuggestionsQuery.data?.files ?? [];

@@ -33,6 +33,7 @@ import {
   AppBottomSheet,
   AppBottomSheetTextInput,
   SheetActionRow,
+  SheetSelectedDot,
 } from "@/components/ui/bottom-sheet";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
@@ -40,7 +41,6 @@ import { Text } from "@/components/ui/text";
 import { codexRelayRepositoryUrl } from "@/constants/links";
 import { Fonts } from "@/constants/theme";
 import { useTheme } from "@/hooks/use-theme";
-import { hasCodexRelaySession } from "@/lib/codex-relay-api";
 import { hapticLightImpact, hapticSelection, hapticSuccess } from "@/lib/haptics";
 import {
   archiveThreadServerState,
@@ -62,12 +62,23 @@ import { workspaceName } from "@/lib/workspace-name";
 import {
   chatStore$,
   requestThreadStreamReconnect,
+  resetChatSessionState,
   setActiveThread,
   setConnection,
-  setHasPairedSession,
   setThreadMessagesLoading,
 } from "@/state/chat-store";
-import { pinnedThreadStore$, togglePinnedThread, unpinThread } from "@/state/pinned-thread-store";
+import {
+  hasPairedHostSession,
+  pairedHostDisplayName,
+  pairedHostStore$,
+  setActivePairedHost,
+} from "@/state/paired-host-store";
+import {
+  pinnedThreadIdsForActiveHost,
+  pinnedThreadStore$,
+  togglePinnedThread,
+  unpinThread,
+} from "@/state/pinned-thread-store";
 import { buildDrawerRows, type DrawerRow } from "./thread-drawer-rows";
 
 type WorkspaceBrowser = {
@@ -163,11 +174,20 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
   const insets = useSafeAreaInsets();
   const theme = useTheme();
   const queryClient = useQueryClient();
+  const pairedHostRegistry = useSelector(() => pairedHostStore$.get());
+  const activeHostId = pairedHostRegistry.activeHostId;
+  const pairedHosts = pairedHostRegistry.hostIds.flatMap((hostId) => {
+    const host = pairedHostRegistry.hostsById[hostId];
+    return host ? [host] : [];
+  });
+  const activeHost = activeHostId ? pairedHostRegistry.hostsById[activeHostId] : undefined;
   const createThreadMutation = useMutation({
     mutationFn: (body: Parameters<typeof createThreadServerState>[1]) =>
       createThreadServerState(queryClient, body),
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: serverStateKeys.threads() });
+      await queryClient.invalidateQueries({
+        queryKey: serverStateKeys.threads(activeHostId),
+      });
     },
   });
   const archiveThreadMutation = useMutation({
@@ -176,7 +196,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       const previousActiveThreadId = chatStore$.activeThreadId.peek();
       const currentThreads =
         queryClient.getQueryData<Awaited<ReturnType<typeof serverStateQueryFns.threads>>>(
-          serverStateKeys.threads(),
+          serverStateKeys.threads(activeHostId),
         )?.threads ?? [];
       const nextActiveThreadId = currentThreads.find((thread) => thread.id !== threadId)?.id;
       const snapshot = await optimisticallyArchiveThreadState(queryClient, threadId);
@@ -195,8 +215,10 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       }
     },
     onSuccess: async (_response, threadId) => {
-      unpinThread(threadId);
-      await queryClient.invalidateQueries({ queryKey: serverStateKeys.threads() });
+      unpinThread(threadId, activeHostId);
+      await queryClient.invalidateQueries({
+        queryKey: serverStateKeys.threads(activeHostId),
+      });
     },
   });
   const renameThreadMutation = useMutation({
@@ -204,7 +226,11 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       renameThreadServerState(queryClient, threadId, { title }),
   });
   const activeThreadId = useSelector(() => chatStore$.activeThreadId.get());
-  const pinnedThreadIds = useSelector(() => pinnedThreadStore$.threadIds.get());
+  const pinnedThreadIds = useSelector(() => {
+    pinnedThreadStore$.threadIdsByHostId[activeHostId ?? "__unpaired__"].get();
+    pinnedThreadStore$.threadIds.get();
+    return [...pinnedThreadIdsForActiveHost()];
+  });
   const statusQuery = useQuery({
     queryKey: serverStateKeys.status(),
     queryFn: serverStateQueryFns.status,
@@ -231,6 +257,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
   );
   const [uiState, dispatchUi] = useReducer(threadDrawerUiReducer, initialThreadDrawerUiState);
   const [renameDraft, setRenameDraft] = useState("");
+  const [isHostPickerVisible, setHostPickerVisible] = useState(false);
   const [threadWithActions, setThreadWithActions] = useState<ThreadSummary | undefined>(undefined);
   const [threadToRename, setThreadToRename] = useState<ThreadSummary | undefined>(undefined);
   const {
@@ -322,7 +349,6 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       setThreadToRename(undefined);
       setRenameDraft("");
     } catch (caught) {
-      setHasPairedSession(hasCodexRelaySession());
       Alert.alert(
         "Couldn’t rename chat",
         caught instanceof Error ? caught.message : "Unable to rename this chat.",
@@ -439,6 +465,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
 
   const listHeader = (
     <DrawerListHeader
+      activeHostName={pairedHostDisplayName(activeHost)}
       isRefreshingProjects={isRefreshingProjects}
       onCloseMenu={() => {
         hapticSelection();
@@ -446,6 +473,7 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
       }}
       showCloseButton={!props.isPermanent}
       onNewChat={() => void openNewThreadWorkspacePicker()}
+      onOpenHostPicker={() => setHostPickerVisible(true)}
       onRefreshProjects={() => void refreshProjects()}
       onSearchChange={(value) => dispatchUi({ type: "set-search-query", value })}
       onSearchClear={() => dispatchUi({ type: "set-search-query", value: "" })}
@@ -491,6 +519,48 @@ export function ThreadDrawerContent(props: ThreadDrawerContentProps) {
         </View>
       )}
       <DrawerFooter bottomInset={insets.bottom} onOpenSettings={openSettings} />
+      <AppBottomSheet
+        onClose={() => setHostPickerVisible(false)}
+        scrollable={false}
+        subtitle="Only one computer is active in the foreground."
+        title="Computers"
+        visible={isHostPickerVisible}
+      >
+        {pairedHosts.map((host) => {
+          const selected = host.id === activeHostId;
+          return (
+            <SheetActionRow
+              key={host.id}
+              accessibilityLabel={`Switch to ${pairedHostDisplayName(host)}`}
+              icon="workspace"
+              onPress={() => {
+                if (!selected) {
+                  setActivePairedHost(host.id);
+                  resetChatSessionState();
+                  setConnection("checking");
+                }
+                setHostPickerVisible(false);
+                props.navigation.closeDrawer();
+                router.replace("/");
+              }}
+              selected={selected}
+              subtitle={compactHostUrl(host.activeUrl)}
+              title={pairedHostDisplayName(host)}
+              trailing={<SheetSelectedDot selected={selected} />}
+            />
+          );
+        })}
+        <SheetActionRow
+          accessibilityLabel="Pair another computer"
+          icon="newThread"
+          onPress={() => {
+            setHostPickerVisible(false);
+            props.navigation.closeDrawer();
+            router.push("/pair");
+          }}
+          title="Pair another computer"
+        />
+      </AppBottomSheet>
       <WorkspaceBrowserModal
         currentBrowserPath={currentBrowserPath}
         isCreatingThread={isCreatingThread}
@@ -623,7 +693,7 @@ function useThreadDrawerActions({
   );
 
   const syncPairedSessionState = useCallback(() => {
-    setHasPairedSession(hasCodexRelaySession());
+    return hasPairedHostSession();
   }, []);
 
   const activateSelectedThread = useCallback(
@@ -1083,9 +1153,11 @@ function areDrawerRowItemsEqual(previous: DrawerRowItemProps, next: DrawerRowIte
 }
 
 function DrawerListHeader({
+  activeHostName,
   isRefreshingProjects,
   onCloseMenu,
   onNewChat,
+  onOpenHostPicker,
   onRefreshProjects,
   onSearchChange,
   onSearchClear,
@@ -1094,9 +1166,11 @@ function DrawerListHeader({
   showCloseButton,
   versionCompatibility,
 }: {
+  activeHostName: string;
   isRefreshingProjects: boolean;
   onCloseMenu: () => void;
   onNewChat: () => void;
+  onOpenHostPicker: () => void;
   onRefreshProjects: () => void;
   onSearchChange: (value: string) => void;
   onSearchClear: () => void;
@@ -1123,6 +1197,18 @@ function DrawerListHeader({
           </Button>
         ) : null}
       </View>
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`Current computer: ${activeHostName}`}
+        onPress={onOpenHostPicker}
+        style={({ pressed }) => [styles.hostSelector, pressed && styles.drawerPressedContent]}
+      >
+        <Icon name="workspace" size={15} tintColor={theme.textSecondary} />
+        <Text numberOfLines={1} style={styles.hostSelectorText}>
+          {activeHostName}
+        </Text>
+        <Icon name="expand" size={14} tintColor={theme.textSecondary} />
+      </Pressable>
       <View style={styles.searchShell}>
         <Icon name="search" size={14} tintColor={theme.textSecondary} />
         <TextInput
@@ -1554,6 +1640,10 @@ function formatRelativeTime(value: string) {
   return `${Math.floor(diffMs / day)}d`;
 }
 
+function compactHostUrl(url: string) {
+  return url.replace(/^https?:\/\//, "");
+}
+
 const styles = StyleSheet.create({
   drawerRoot: {
     flex: 1,
@@ -1580,6 +1670,25 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: "600",
     lineHeight: 18,
+  },
+  hostSelector: {
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.055)",
+    borderColor: "rgba(255, 255, 255, 0.08)",
+    borderRadius: 8,
+    borderWidth: StyleSheet.hairlineWidth,
+    flexDirection: "row",
+    gap: 8,
+    height: 36,
+    marginHorizontal: 4,
+    paddingHorizontal: 10,
+  },
+  hostSelectorText: {
+    flex: 1,
+    fontSize: 12,
+    fontWeight: "600",
+    lineHeight: 16,
+    minWidth: 0,
   },
   searchShell: {
     alignItems: "center",

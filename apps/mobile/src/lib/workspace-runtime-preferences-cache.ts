@@ -55,6 +55,15 @@ export function cacheWorkspaceRuntimePreferencesFromStatus(
   }
 }
 
+export function removeCachedWorkspaceRuntimePreferencesForHost(hostId: string) {
+  const prefix = `${normalizeServerUrl(hostId)}::`;
+  for (const key of storage.getAllKeys()) {
+    if (key.startsWith(prefix)) {
+      storage.remove(key);
+    }
+  }
+}
+
 function cacheKey(serverUrl: string, workspacePath: string) {
   return `${normalizeServerUrl(serverUrl)}::${workspacePath}`;
 }

@@ -1,4 +1,4 @@
-import { createPrivateKey, randomUUID, sign, type KeyObject } from "node:crypto";
+import { createHash, createPrivateKey, randomUUID, sign, type KeyObject } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { connect, type ClientHttp2Session } from "node:http2";
 import { setInterval } from "node:timers";
@@ -20,6 +20,7 @@ const invalidDeviceTokenReasons = new Set([
 export type PushNotificationIntent = "turn_terminal" | "action_required" | "test";
 
 export type PushNotificationEvent = {
+  body?: string;
   eventId: string;
   intent: PushNotificationIntent;
   threadId: string;
@@ -32,6 +33,7 @@ export type ApnsNotification = PushNotificationEvent & {
   deviceToken: string;
   environment: "development" | "production";
   expiresAt: number;
+  relayId?: string;
 };
 
 export type ApnsSendResult = {
@@ -174,6 +176,7 @@ export function createApnsPushNotificationSenderFromEnvironment(
 }
 
 export function createPushNotificationDispatcher(input: {
+  relayId?: string;
   sender: PushNotificationSender;
   sessions: PairingSessionStore;
   now?: () => number;
@@ -196,7 +199,7 @@ export function createPushNotificationDispatcher(input: {
     const currentDrain = (async () => {
       while (drainRequested) {
         drainRequested = false;
-        await drainOutbox(input.sessions, input.sender, now);
+        await drainOutbox(input.sessions, input.sender, now, input.relayId);
       }
     })();
     drainPromise = currentDrain;
@@ -262,6 +265,7 @@ async function drainOutbox(
   sessions: PairingSessionStore,
   sender: PushNotificationSender,
   now: () => number,
+  relayId?: string,
 ) {
   for (;;) {
     const currentTime = now();
@@ -271,7 +275,7 @@ async function drainOutbox(
       return;
     }
     for (const delivery of deliveries) {
-      await deliver(sessions, sender, delivery, now);
+      await deliver(sessions, sender, delivery, now, relayId);
     }
   }
 }
@@ -281,10 +285,17 @@ async function deliver(
   sender: PushNotificationSender,
   delivery: PushNotificationDelivery,
   now: () => number,
+  relayId?: string,
 ) {
   let result: ApnsSendResult;
   try {
-    result = await sender.send(delivery);
+    result = await sender.send({
+      ...delivery,
+      collapseId: relayId
+        ? createHash("sha256").update(`${relayId}:${delivery.collapseId}`).digest("hex")
+        : delivery.collapseId,
+      relayId,
+    });
   } catch (error) {
     result = {
       accepted: false,
@@ -336,11 +347,12 @@ async function deliver(
 
 function notificationPayload(notification: ApnsNotification) {
   const body =
-    notification.intent === "action_required"
+    notification.body ||
+    (notification.intent === "action_required"
       ? "Codex needs your attention."
       : notification.intent === "test"
         ? "Test notification delivered."
-        : "A Codex turn has finished.";
+        : "A Codex turn has finished.");
   return {
     aps: {
       alert: { body, title: "Codex Relay" },
@@ -348,6 +360,7 @@ function notificationPayload(notification: ApnsNotification) {
     },
     eventId: notification.eventId,
     intent: notification.intent,
+    ...(notification.relayId ? { relayId: notification.relayId } : {}),
     threadId: notification.threadId,
     ...(notification.turnId ? { turnId: notification.turnId } : {}),
   };

@@ -14,7 +14,7 @@ import type {
   ThreadSummary,
 } from "codex-relay/api-schema";
 
-import { resetWorkspacePreviewState } from "./workspace-preview-store";
+import { getActiveHostId } from "./paired-host-store";
 
 type ConnectionState = "checking" | "connected" | "offline";
 
@@ -42,13 +42,11 @@ type ChatState = {
   queuedPromptsByThreadId: Record<string, QueuedComposerPrompt[]>;
   connection: ConnectionState;
   error?: string;
-  hasPairedSession: boolean;
   threadMessagesLoadingByThreadId: Record<string, boolean>;
   threadStreamReconnectRequest?: {
     requestId: number;
     threadId: string;
   };
-  machineName?: string;
   contextUsageByThreadId: Record<string, ContextWindowUsage>;
   messagesByThreadId: Record<string, ChatMessage[]>;
   models: CodexModel[];
@@ -57,7 +55,6 @@ type ChatState = {
   runtimePreferencesByWorkspacePath: Record<string, RuntimePreferences>;
   selectedReasoningEffort?: ReasoningEffort;
   selectedModel?: string;
-  serverUrl: string;
   threadIds: string[];
   threadsById: Record<string, ThreadSummary>;
   workspacePath?: string;
@@ -72,10 +69,8 @@ export const chatStore$ = observable<ChatState>({
   queuedPromptsByThreadId: {},
   connection: "checking",
   error: undefined,
-  hasPairedSession: false,
   threadMessagesLoadingByThreadId: {},
   threadStreamReconnectRequest: undefined,
-  machineName: undefined,
   contextUsageByThreadId: {},
   messagesByThreadId: {},
   models: [],
@@ -84,7 +79,6 @@ export const chatStore$ = observable<ChatState>({
   runtimePreferencesByWorkspacePath: {},
   selectedReasoningEffort: undefined,
   selectedModel: undefined,
-  serverUrl: "",
   threadIds: [],
   threadsById: {},
   workspacePath: undefined,
@@ -101,7 +95,7 @@ export function setConnection(connection: ConnectionState, error?: string) {
 const NEW_THREAD_COMPOSER_KEY = "__new_thread__";
 
 export function composerThreadKey(threadId: string | undefined) {
-  return threadId ?? NEW_THREAD_COMPOSER_KEY;
+  return `${getActiveHostId() ?? "__unpaired__"}::${threadId ?? NEW_THREAD_COMPOSER_KEY}`;
 }
 
 export function activeComposerThreadKey() {
@@ -240,26 +234,8 @@ export function removeQueuedPrompt(threadId: string, id: string) {
   );
 }
 
-export function setHasPairedSession(hasPairedSession: boolean) {
-  if (chatStore$.hasPairedSession.peek() === hasPairedSession) {
-    return;
-  }
-  chatStore$.hasPairedSession.set(hasPairedSession);
-}
-
 export function setWorkspacePath(workspacePath: string | undefined) {
   chatStore$.workspacePath.set(workspacePath);
-}
-
-export function setMachineName(machineName: string | undefined) {
-  chatStore$.machineName.set(machineName);
-}
-
-export function setServerUrl(serverUrl: string) {
-  if (chatStore$.serverUrl.peek() === serverUrl) {
-    return;
-  }
-  chatStore$.serverUrl.set(serverUrl);
 }
 
 export function setRunning(isRunning: boolean) {
@@ -354,15 +330,17 @@ export function setThreadCollaborationMode(
 
 export function moveNewThreadCollaborationMode(
   threadId: string,
-  collaborationMode = chatStore$.collaborationModeByThreadId[NEW_THREAD_COMPOSER_KEY].peek() ??
+  collaborationMode = chatStore$.collaborationModeByThreadId[composerThreadKey(undefined)].peek() ??
     "default",
 ) {
+  const sourceKey = composerThreadKey(undefined);
+  const targetKey = composerThreadKey(threadId);
   chatStore$.collaborationModeByThreadId.set((current) => {
-    const { [NEW_THREAD_COMPOSER_KEY]: _removed, ...rest } = current;
+    const { [sourceKey]: _removed, ...rest } = current;
     if (collaborationMode === "default") {
       return rest;
     }
-    return { ...rest, [threadId]: collaborationMode };
+    return { ...rest, [targetKey]: collaborationMode };
   });
 }
 
@@ -437,14 +415,9 @@ export function activateThreadSnapshot(thread: ThreadSummary, messages?: ChatMes
 
 export function resetChatSessionState() {
   chatStore$.activeThreadId.set(undefined);
-  chatStore$.composerAttachmentsByThreadId.set({});
-  chatStore$.composerDraftByThreadId.set({});
-  chatStore$.composerSkillsByThreadId.set({});
-  chatStore$.collaborationModeByThreadId.set({});
   chatStore$.queuedPromptsByThreadId.set({});
   chatStore$.connection.set("offline");
   chatStore$.error.set("Pair with your computer to continue.");
-  chatStore$.hasPairedSession.set(false);
   chatStore$.threadMessagesLoadingByThreadId.set({});
   chatStore$.threadStreamReconnectRequest.set(undefined);
   chatStore$.contextUsageByThreadId.set({});
@@ -452,13 +425,19 @@ export function resetChatSessionState() {
   chatStore$.models.set([]);
   chatStore$.rateLimitBuckets.set([]);
   chatStore$.runtimePreferencesByWorkspacePath.set({});
-  resetWorkspacePreviewState();
-  chatStore$.machineName.set(undefined);
   chatStore$.selectedReasoningEffort.set(undefined);
   chatStore$.selectedModel.set(undefined);
   chatStore$.threadIds.set([]);
   chatStore$.threadsById.set({});
   chatStore$.workspacePath.set(undefined);
+}
+
+export function removeChatHostLocalState(hostId: string) {
+  const prefix = `${hostId}::`;
+  chatStore$.composerAttachmentsByThreadId.set((current) => withoutHostEntries(current, prefix));
+  chatStore$.composerDraftByThreadId.set((current) => withoutHostEntries(current, prefix));
+  chatStore$.composerSkillsByThreadId.set((current) => withoutHostEntries(current, prefix));
+  chatStore$.collaborationModeByThreadId.set((current) => withoutHostEntries(current, prefix));
 }
 
 export function replaceThreads(threads: ThreadSummary[]) {
@@ -673,10 +652,12 @@ function shouldStreamEventUpdateActiveThread(sourceThreadId: string | undefined)
 }
 
 function moveThreadScopedState(sourceThreadId: string, targetThreadId: string) {
-  moveRecordValue(chatStore$.composerAttachmentsByThreadId, sourceThreadId, targetThreadId);
-  moveRecordValue(chatStore$.composerDraftByThreadId, sourceThreadId, targetThreadId);
-  moveRecordValue(chatStore$.composerSkillsByThreadId, sourceThreadId, targetThreadId);
-  moveRecordValue(chatStore$.collaborationModeByThreadId, sourceThreadId, targetThreadId);
+  const sourceComposerKey = composerThreadKey(sourceThreadId);
+  const targetComposerKey = composerThreadKey(targetThreadId);
+  moveRecordValue(chatStore$.composerAttachmentsByThreadId, sourceComposerKey, targetComposerKey);
+  moveRecordValue(chatStore$.composerDraftByThreadId, sourceComposerKey, targetComposerKey);
+  moveRecordValue(chatStore$.composerSkillsByThreadId, sourceComposerKey, targetComposerKey);
+  moveRecordValue(chatStore$.collaborationModeByThreadId, sourceComposerKey, targetComposerKey);
   moveRecordValue(chatStore$.contextUsageByThreadId, sourceThreadId, targetThreadId);
   moveRecordValue(chatStore$.queuedPromptsByThreadId, sourceThreadId, targetThreadId);
   moveRecordValue(chatStore$.threadMessagesLoadingByThreadId, sourceThreadId, targetThreadId);
@@ -696,6 +677,10 @@ function moveRecordValue<T>(
     const { [sourceKey]: value, ...rest } = current;
     return { ...rest, [targetKey]: value };
   });
+}
+
+function withoutHostEntries<T>(record: Record<string, T>, prefix: string) {
+  return Object.fromEntries(Object.entries(record).filter(([key]) => !key.startsWith(prefix)));
 }
 
 function sortThreadIds(threads: ThreadSummary[]) {

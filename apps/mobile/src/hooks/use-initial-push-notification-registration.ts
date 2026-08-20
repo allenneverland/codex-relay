@@ -10,35 +10,51 @@ import {
   getApnsPushRegistration,
   supportsPushNotifications,
 } from "@/lib/push-notifications";
-import { chatStore$ } from "@/state/chat-store";
+import { hasPairedHostSession, pairedHostStore$ } from "@/state/paired-host-store";
 
 export function useInitialPushNotificationRegistration() {
-  const hasPairedSession = useSelector(() => chatStore$.hasPairedSession.get());
-  const preferencesRef = useRef<PushNotificationPreferences>(defaultPushNotificationPreferences);
+  const hostIds = useSelector(() => pairedHostStore$.hostIds.get());
+  const pairingRevision = useSelector(() => pairedHostStore$.pairingRevision.get());
+  const hostIdsRef = useRef(hostIds);
+  const preferencesRef = useRef<Record<string, PushNotificationPreferences>>({});
   const syncPromiseRef = useRef<Promise<void> | undefined>(undefined);
+  const syncRequestedRef = useRef(false);
+
+  hostIdsRef.current = hostIds;
 
   useEffect(() => {
-    if (!hasPairedSession || !supportsPushNotifications()) {
+    if (hostIds.length === 0 || !supportsPushNotifications()) {
       return;
     }
 
     const syncRegistration = () => {
       if (syncPromiseRef.current) {
+        syncRequestedRef.current = true;
         return syncPromiseRef.current;
       }
       const sync = (async () => {
-        const settings = await getPushNotificationSettings();
-        const preferences =
-          settings.registered ||
-          settings.preferences.actionRequired ||
-          settings.preferences.turnTerminal
-            ? settings.preferences
-            : defaultPushNotificationPreferences;
-        preferencesRef.current = preferences;
-        await registerPushNotifications({
-          ...(await getApnsPushRegistration()),
-          preferences,
-        });
+        do {
+          syncRequestedRef.current = false;
+          const registration = await getApnsPushRegistration();
+          for (const hostId of hostIdsRef.current) {
+            if (!hasPairedHostSession(hostId)) {
+              continue;
+            }
+            try {
+              const settings = await getPushNotificationSettings(hostId);
+              const preferences =
+                settings.registered ||
+                settings.preferences.actionRequired ||
+                settings.preferences.turnTerminal
+                  ? settings.preferences
+                  : defaultPushNotificationPreferences;
+              preferencesRef.current[hostId] = preferences;
+              await registerPushNotifications({ ...registration, preferences }, hostId);
+            } catch {
+              // One offline host must not prevent the others from registering.
+            }
+          }
+        } while (syncRequestedRef.current);
       })();
       syncPromiseRef.current = sync;
       const clearSync = () => {
@@ -57,15 +73,23 @@ export function useInitialPushNotificationRegistration() {
       }
     });
     const tokenSubscription = addApnsPushTokenListener((registration) => {
-      void registerPushNotifications({
-        ...registration,
-        preferences: preferencesRef.current,
-      }).catch(() => undefined);
+      for (const hostId of hostIdsRef.current) {
+        if (!hasPairedHostSession(hostId)) {
+          continue;
+        }
+        void registerPushNotifications(
+          {
+            ...registration,
+            preferences: preferencesRef.current[hostId] ?? defaultPushNotificationPreferences,
+          },
+          hostId,
+        ).catch(() => undefined);
+      }
     });
 
     return () => {
       appStateSubscription.remove();
       tokenSubscription.remove();
     };
-  }, [hasPairedSession]);
+  }, [hostIds, pairingRevision]);
 }

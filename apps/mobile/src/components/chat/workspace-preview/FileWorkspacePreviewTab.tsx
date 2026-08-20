@@ -19,7 +19,11 @@ import { Icon } from "@/components/ui/icon";
 import { Colors, Fonts, Spacing } from "@/constants/theme";
 import { getWorkspaceFileContent, listWorkspaceFiles } from "@/lib/codex-relay-api";
 import { hapticSelection } from "@/lib/haptics";
-import { workspaceFileContentQueryKey } from "@/lib/workspace-file-queries";
+import {
+  relayHostIdFromQueryKey,
+  workspaceFileContentQueryKey,
+} from "@/lib/workspace-file-queries";
+import { getActiveHostId } from "@/state/paired-host-store";
 
 import { WorkspaceCodeWebView } from "./WorkspaceCodeWebView";
 
@@ -58,18 +62,23 @@ export const FileWorkspacePreviewTab = memo(function FileWorkspacePreviewTab({
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [isPullRefreshing, setPullRefreshing] = useState(false);
   const fileListQueryKey = [
-    "codex-relay-workspace-preview-files",
+    "codex-relay",
+    getActiveHostId() ?? "__unpaired__",
+    "workspace-preview-files",
     workspacePath ?? null,
     currentDirectory,
     debouncedQuery,
   ];
   const filesQuery = useQuery({
-    queryFn: () =>
-      listWorkspaceFiles({
-        directory: currentDirectory,
-        query: debouncedQuery,
-        workspacePath,
-      }),
+    queryFn: ({ queryKey }) =>
+      listWorkspaceFiles(
+        {
+          directory: currentDirectory,
+          query: debouncedQuery,
+          workspacePath,
+        },
+        relayHostIdFromQueryKey(queryKey),
+      ),
     queryKey: fileListQueryKey,
     staleTime: 10_000,
   });
@@ -100,7 +109,11 @@ export const FileWorkspacePreviewTab = memo(function FileWorkspacePreviewTab({
   );
   const fileContentQuery = useQuery({
     enabled: Boolean(selectedPath),
-    queryFn: () => getWorkspaceFileContent({ path: selectedPath ?? "", workspacePath }),
+    queryFn: ({ queryKey }) =>
+      getWorkspaceFileContent(
+        { path: selectedPath ?? "", workspacePath },
+        relayHostIdFromQueryKey(queryKey),
+      ),
     queryKey: fileContentQueryKey,
     staleTime: 10_000,
   });

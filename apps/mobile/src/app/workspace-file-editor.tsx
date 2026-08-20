@@ -1,5 +1,6 @@
 import type { WorkspaceFileContentResponse } from "codex-relay/api-schema";
 import { router, useLocalSearchParams } from "expo-router";
+import { useSelector } from "@legendapp/state/react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ActivityIndicator, Alert, Pressable, View } from "react-native";
@@ -20,26 +21,33 @@ import { Colors, Spacing } from "@/constants/theme";
 import { getWorkspaceFileContent, updateWorkspaceFileContent } from "@/lib/codex-relay-api";
 import { hapticSelection } from "@/lib/haptics";
 import {
+  relayHostIdFromQueryKey,
   workspaceFileContentQueryKey,
   workspaceFilesQueryKeyPrefix,
 } from "@/lib/workspace-file-queries";
+import { pairedHostStore$ } from "@/state/paired-host-store";
 
 export default function WorkspaceFileEditorScreen() {
   const params = useLocalSearchParams<{ path?: string; workspacePath?: string }>();
   const path = normalizedParam(params.path);
   const workspacePath = normalizedParam(params.workspacePath);
+  const activeHostId = useSelector(() => pairedHostStore$.activeHostId.get());
   const queryClient = useQueryClient();
   const keyboardAvoidingEnabled = useKeyboardState(
     (state) => state.isVisible && state.height > 120,
   );
   const [draftContent, setDraftContent] = useState("");
   const fileContentQueryKey = useMemo(
-    () => workspaceFileContentQueryKey(workspacePath, path ?? null),
-    [path, workspacePath],
+    () => workspaceFileContentQueryKey(workspacePath, path ?? null, activeHostId),
+    [activeHostId, path, workspacePath],
   );
   const fileContentQuery = useQuery({
     enabled: Boolean(path),
-    queryFn: () => getWorkspaceFileContent({ path: path ?? "", workspacePath }),
+    queryFn: ({ queryKey }) =>
+      getWorkspaceFileContent(
+        { path: path ?? "", workspacePath },
+        relayHostIdFromQueryKey(queryKey),
+      ),
     queryKey: fileContentQueryKey,
     staleTime: 10_000,
   });
@@ -51,16 +59,25 @@ export default function WorkspaceFileEditorScreen() {
   const lineCount = lineCountFor(draftContent || fileContent?.content || "");
   const saveFileMutation = useMutation({
     mutationFn: (input: { content: string; path: string }) =>
-      updateWorkspaceFileContent({
-        content: input.content,
-        path: input.path,
-        workspacePath,
-      }),
+      updateWorkspaceFileContent(
+        {
+          content: input.content,
+          path: input.path,
+          workspacePath,
+        },
+        activeHostId,
+      ),
     onSuccess: (nextFile, input) => {
-      const nextFileContentQueryKey = workspaceFileContentQueryKey(workspacePath, input.path);
+      const nextFileContentQueryKey = workspaceFileContentQueryKey(
+        workspacePath,
+        input.path,
+        activeHostId,
+      );
       queryClient.setQueryData(nextFileContentQueryKey, nextFile);
       void queryClient.invalidateQueries({ queryKey: nextFileContentQueryKey });
-      void queryClient.invalidateQueries({ queryKey: workspaceFilesQueryKeyPrefix(workspacePath) });
+      void queryClient.invalidateQueries({
+        queryKey: workspaceFilesQueryKeyPrefix(workspacePath, activeHostId),
+      });
       setDraftContent(nextFile.content);
       hapticSelection();
     },

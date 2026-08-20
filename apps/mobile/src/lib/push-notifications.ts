@@ -78,12 +78,30 @@ export function addApnsPushTokenListener(
   });
 }
 
-export function notificationResponseThreadId(response: Notifications.NotificationResponse) {
-  const data = response.notification.request.content.data;
+export function notificationResponseTarget(response: Notifications.NotificationResponse) {
+  const data = notificationResponseData(response);
   const threadId = data?.threadId;
-  return typeof threadId === "string" && threadId.trim() && threadId !== "test"
-    ? threadId
-    : undefined;
+  if (typeof threadId !== "string" || !threadId.trim() || threadId === "test") {
+    return undefined;
+  }
+  const relayId = data?.relayId;
+  return {
+    relayId: typeof relayId === "string" && relayId.trim() ? relayId : undefined,
+    threadId,
+  };
+}
+
+function notificationResponseData(response: Notifications.NotificationResponse) {
+  const contentData = response.notification.request.content.data;
+  if (contentData && Object.keys(contentData).length > 0) {
+    return contentData;
+  }
+  const trigger = response.notification.request.trigger;
+  if (!trigger || typeof trigger !== "object" || !("payload" in trigger)) {
+    return undefined;
+  }
+  const payload = trigger.payload;
+  return payload && typeof payload === "object" ? payload : undefined;
 }
 
 function assertIosBundle() {

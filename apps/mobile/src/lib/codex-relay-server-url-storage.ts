@@ -1,10 +1,13 @@
-import { createMMKV } from "react-native-mmkv";
+import {
+  codexRelayStorage,
+  getActivePairedHost,
+  getActiveHostId,
+  updatePairedHostUrl,
+  updatePairedHostUrlCandidates,
+} from "../state/paired-host-store";
 
 const defaultServerUrl = "http://localhost:8787";
-const serverUrlCandidatesStorageKey = "codex-relay.server-url-candidates";
-const serverUrlStorageKey = "codex-relay.server-url";
-
-export const codexRelayStorage = createMMKV({ id: "codex-relay" });
+export { codexRelayStorage };
 
 export type CodexRelayServerUrlCandidate = {
   label: string;
@@ -15,29 +18,33 @@ export const fallbackCodexRelayServerUrl =
   process.env.EXPO_PUBLIC_CODEX_RELAY_SERVER_URL?.replace(/\/$/, "") ?? defaultServerUrl;
 
 export function getCodexRelayServerUrl() {
-  return codexRelayStorage.getString(serverUrlStorageKey) ?? fallbackCodexRelayServerUrl;
+  return getActivePairedHost()?.activeUrl ?? fallbackCodexRelayServerUrl;
 }
 
 export function getCodexRelayServerUrlCandidates(): CodexRelayServerUrlCandidate[] {
-  return serverUrlCandidatesFromUrls([
-    getCodexRelayServerUrl(),
-    ...readStoredServerUrlCandidates(),
-  ]);
+  const host = getActivePairedHost();
+  return serverUrlCandidatesFromUrls(host?.urlCandidates ?? [getCodexRelayServerUrl()]);
 }
 
 export function setCodexRelayServerUrl(url: string) {
   const normalizedUrl = normalizeServerUrl(url);
-  codexRelayStorage.set(serverUrlStorageKey, normalizedUrl);
+  const hostId = getActiveHostId();
+  if (hostId) {
+    updatePairedHostUrl(hostId, normalizedUrl);
+  }
   return normalizedUrl;
 }
 
 export function clearCodexRelayServerUrlState() {
-  codexRelayStorage.remove(serverUrlStorageKey);
-  codexRelayStorage.remove(serverUrlCandidatesStorageKey);
+  // Pairing records own server URL state. Kept as a compatibility no-op for callers
+  // that only need to clear the active in-memory server projection.
 }
 
 export function saveCodexRelayServerUrlCandidates(urls: string[]) {
-  codexRelayStorage.set(serverUrlCandidatesStorageKey, JSON.stringify(dedupeServerUrls(urls)));
+  const hostId = getActiveHostId();
+  if (hostId) {
+    updatePairedHostUrlCandidates(hostId, urls);
+  }
 }
 
 export function normalizeServerUrl(url: string) {
@@ -89,22 +96,6 @@ export function isLocalIPv6Host(host: string) {
   return (
     normalized.startsWith("fe80:") || normalized.startsWith("fc") || normalized.startsWith("fd")
   );
-}
-
-function readStoredServerUrlCandidates() {
-  const stored = codexRelayStorage.getString(serverUrlCandidatesStorageKey);
-  if (!stored) {
-    return [];
-  }
-
-  try {
-    const parsed: unknown = JSON.parse(stored);
-    return Array.isArray(parsed)
-      ? parsed.filter((url): url is string => typeof url === "string")
-      : [];
-  } catch {
-    return [];
-  }
 }
 
 function serverUrlCandidatesFromUrls(urls: string[]): CodexRelayServerUrlCandidate[] {

@@ -40,6 +40,7 @@ export type PushNotificationSubscription = PushNotificationPreferences & {
 };
 
 export type PushNotificationOutboxEvent = {
+  body?: string;
   eventId: string;
   intent: "turn_terminal" | "action_required" | "test";
   threadId: string;
@@ -191,6 +192,7 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
       intent TEXT NOT NULL,
       thread_id TEXT NOT NULL,
       turn_id TEXT,
+      body TEXT,
       created_at INTEGER NOT NULL
     );
 
@@ -201,6 +203,7 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
       intent TEXT NOT NULL,
       thread_id TEXT NOT NULL,
       turn_id TEXT,
+      body TEXT,
       collapse_id TEXT NOT NULL,
       status TEXT NOT NULL,
       attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -230,6 +233,7 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
     );
   `);
   await ensurePairingSessionColumns();
+  await ensurePushNotificationColumns();
 
   async function countActive() {
     const row = await db
@@ -241,7 +245,26 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
   }
 
   async function deleteSession(tokenHash: string) {
-    await db.prepare("DELETE FROM pairing_sessions WHERE token_hash = ?").run(tokenHash);
+    await db.transaction(async (transaction) => {
+      const row = await transaction
+        .prepare(
+          "SELECT client_session_id AS clientSessionId FROM pairing_sessions WHERE token_hash = ?",
+        )
+        .get(tokenHash);
+      await transaction.prepare("DELETE FROM pairing_sessions WHERE token_hash = ?").run(tokenHash);
+      if (typeof row?.clientSessionId !== "string") {
+        return;
+      }
+      await transaction
+        .prepare("DELETE FROM apns_push_notification_subscriptions WHERE client_session_id = ?")
+        .run(row.clientSessionId);
+      await transaction
+        .prepare("DELETE FROM push_notification_subscriptions WHERE client_session_id = ?")
+        .run(row.clientSessionId);
+      await transaction
+        .prepare("DELETE FROM push_notification_deliveries WHERE client_session_id = ?")
+        .run(row.clientSessionId);
+    })();
   }
 
   async function deletePendingPairing(approvalCode: string) {
@@ -375,10 +398,17 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
         const eventInsert = await transaction
           .prepare(
             `INSERT OR IGNORE INTO push_notification_events (
-             event_id, intent, thread_id, turn_id, created_at
-           ) VALUES (?, ?, ?, ?, ?)`,
+             event_id, intent, thread_id, turn_id, body, created_at
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
           )
-          .run(event.eventId, event.intent, event.threadId, event.turnId ?? null, now);
+          .run(
+            event.eventId,
+            event.intent,
+            event.threadId,
+            event.turnId ?? null,
+            event.body ?? null,
+            now,
+          );
         if (affectedRows(eventInsert) === 0) {
           return 0;
         }
@@ -420,6 +450,7 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
                intent,
                thread_id,
                turn_id,
+               body,
                collapse_id,
                status,
                attempt_count,
@@ -428,7 +459,7 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
                created_at,
                updated_at
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)`,
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)`,
             )
             .run(
               deliveryKey,
@@ -437,6 +468,7 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
               event.intent,
               event.threadId,
               event.turnId ?? null,
+              event.body ?? null,
               collapseIdForEvent(event.eventId),
               now,
               expiresAt,
@@ -644,6 +676,7 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
                   deliveries.intent,
                   deliveries.thread_id AS threadId,
                   deliveries.turn_id AS turnId,
+                  deliveries.body,
                   deliveries.collapse_id AS collapseId,
                   deliveries.attempt_count AS attemptCount,
                   deliveries.expires_at AS expiresAt,
@@ -949,6 +982,16 @@ export async function createTursoPairingSessionStore(path: string): Promise<Pair
       await db.exec("ALTER TABLE pending_pairings ADD COLUMN client_session_id TEXT");
     }
   }
+
+  async function ensurePushNotificationColumns() {
+    for (const table of ["push_notification_events", "push_notification_deliveries"]) {
+      const rows = await db.prepare(`PRAGMA table_info(${table})`).all();
+      const columns = new Set(resultRows(rows).map((row) => String(row.name)));
+      if (!columns.has("body")) {
+        await db.exec(`ALTER TABLE ${table} ADD COLUMN body TEXT`);
+      }
+    }
+  }
 }
 
 function encodeSecureSession(session: SecureSession | undefined) {
@@ -1026,6 +1069,7 @@ function pushNotificationDeliveryFromRow(
 
   return {
     attemptCount: Number(row.attemptCount),
+    ...(typeof row.body === "string" ? { body: row.body } : {}),
     bundleId: row.bundleId,
     clientSessionId: row.clientSessionId,
     collapseId: row.collapseId,

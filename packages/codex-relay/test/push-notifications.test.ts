@@ -13,7 +13,7 @@ import {
 } from "../src/push-notifications.js";
 
 describe("APNs push notification sender", () => {
-  it("routes sandbox and production requests with APNs alert headers and generic payloads", async () => {
+  it("routes sandbox and production requests with APNs alert headers", async () => {
     const requests: Array<{
       body: string;
       endpoint: string;
@@ -35,6 +35,7 @@ describe("APNs push notification sender", () => {
       now: () => 1_800_000_000_000,
     });
     const notification: ApnsNotification = {
+      body: "The requested change is complete.",
       bundleId: "com.allenneverland.codexrelay",
       collapseId: "event-1",
       deviceToken: "a".repeat(64),
@@ -42,6 +43,7 @@ describe("APNs push notification sender", () => {
       eventId: "turn_terminal:thread-1:turn-1",
       expiresAt: 1_800_086_400_000,
       intent: "turn_terminal",
+      relayId: "relay-identity-1",
       threadId: "thread-1",
       turnId: "turn-1",
     };
@@ -68,11 +70,12 @@ describe("APNs push notification sender", () => {
     expect(requests[0]?.headers.authorization).toMatch(/^bearer [^.]+\.[^.]+\.[^.]+$/);
     expect(JSON.parse(requests[0]!.body)).toEqual({
       aps: {
-        alert: { body: "A Codex turn has finished.", title: "Codex Relay" },
+        alert: { body: "The requested change is complete.", title: "Codex Relay" },
         sound: "default",
       },
       eventId: "turn_terminal:thread-1:turn-1",
       intent: "turn_terminal",
+      relayId: "relay-identity-1",
       threadId: "thread-1",
       turnId: "turn-1",
     });
@@ -108,17 +111,20 @@ describe("durable APNs outbox", () => {
     const sessions = await registeredSessions();
     let currentTime = 1_800_000_000_000;
     let attempts = 0;
+    const deliveredBodies: Array<string | undefined> = [];
     const sender: PushNotificationSender = {
       configured: true,
       topic: "com.allenneverland.codexrelay",
-      async send() {
+      async send(notification) {
         attempts += 1;
+        deliveredBodies.push(notification.body);
         return attempts === 1
           ? { accepted: false, reason: "InternalServerError", status: 500 }
           : { accepted: true, apnsId: "apns-retry", status: 200 };
       },
     };
     const event = {
+      body: "Durable completion message",
       eventId: "turn_terminal:thread-1:turn-1",
       intent: "turn_terminal" as const,
       threadId: "thread-1",
@@ -150,6 +156,7 @@ describe("durable APNs outbox", () => {
 
     await restarted.dispatch(event);
     expect(attempts).toBe(2);
+    expect(deliveredBodies).toEqual(["Durable completion message", "Durable completion message"]);
   });
 
   it("disables a subscription when APNs rejects its device token", async () => {

@@ -1201,6 +1201,47 @@ describe("Codex Relay server routes", () => {
     });
   });
 
+  it("revokes only the authenticated mobile session and its push registration", async () => {
+    const sessions = await createTursoPairingSessionStore(":memory:");
+    await sessions.createSession("client-token-1", {
+      clientSessionId: "phone-session-1",
+      expiresAt: Date.now() + 60_000,
+    });
+    await sessions.createSession("client-token-2", {
+      clientSessionId: "phone-session-2",
+      expiresAt: Date.now() + 60_000,
+    });
+    for (const clientSessionId of ["phone-session-1", "phone-session-2"]) {
+      await sessions.upsertPushNotificationSubscription({
+        actionRequired: true,
+        bundleId: "com.allenneverland.codexrelay",
+        clientSessionId,
+        deviceToken: clientSessionId === "phone-session-1" ? "a".repeat(64) : "b".repeat(64),
+        environment: "development",
+        turnTerminal: true,
+      });
+    }
+    const app = createApp({
+      codex: createMockCodex(),
+      pairing: {
+        createClientToken: () => "unused-client-token",
+        hashClientToken: (token) => token,
+        sessions,
+      },
+    });
+
+    const response = await app.request("/v1/session", {
+      method: "DELETE",
+      headers: { authorization: "Bearer client-token-1" },
+    });
+
+    expect(response.status).toBe(204);
+    expect(await sessions.getValidSession("client-token-1")).toBeUndefined();
+    expect(await sessions.getPushNotificationSubscription("phone-session-1")).toBeUndefined();
+    expect(await sessions.getValidSession("client-token-2")).toBeDefined();
+    expect(await sessions.getPushNotificationSubscription("phone-session-2")).toBeDefined();
+  });
+
   it("registers and removes push notifications through the paired device session", async () => {
     const sessions = await createTursoPairingSessionStore(":memory:");
     await sessions.createSession("client-token", {
@@ -1412,11 +1453,37 @@ describe("Codex Relay server routes", () => {
       });
       handler({
         method: "turn/completed",
-        params: { status: "completed", threadId: "thread-1", turnId: "turn-1" },
+        params: {
+          threadId: "thread-1",
+          turn: {
+            id: "turn-1",
+            items: [
+              {
+                id: "message-1",
+                text: "Implemented the requested notification.",
+                type: "agentMessage",
+              },
+            ],
+            status: "completed",
+          },
+        },
       });
       handler({
         method: "turn/completed",
-        params: { status: "completed", threadId: "thread-1", turnId: "turn-1" },
+        params: {
+          threadId: "thread-1",
+          turn: {
+            id: "turn-1",
+            items: [
+              {
+                id: "message-1",
+                text: "Implemented the requested notification.",
+                type: "agentMessage",
+              },
+            ],
+            status: "completed",
+          },
+        },
       });
       handler({
         method: "turn/completed",
@@ -1443,6 +1510,7 @@ describe("Codex Relay server routes", () => {
     await waitUntil(() => expect(sent).toHaveLength(2));
     expect(sent).toEqual([
       expect.objectContaining({
+        body: "Implemented the requested notification.",
         intent: "turn_terminal",
         threadId: "thread-1",
         turnId: "turn-1",

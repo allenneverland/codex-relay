@@ -22,22 +22,13 @@ import {
   promptSkillDisplayName,
   promptSkillMentionTextCandidates,
 } from "codex-relay/api-schema";
-import {
-  CameraView,
-  useCameraPermissions,
-  type BarcodeScanningResult,
-  type ScanningResult,
-} from "expo-camera";
 import * as ImagePicker from "expo-image-picker";
-import { useFocusEffect, useNavigation } from "expo-router";
+import { router, useFocusEffect, useNavigation } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   AppState,
   Keyboard,
-  Linking,
-  Modal,
-  Pressable,
   type LayoutChangeEvent,
   useWindowDimensions,
   View,
@@ -46,21 +37,15 @@ import { Gesture, GestureDetector } from "react-native-gesture-handler";
 import { KeyboardController } from "react-native-keyboard-controller";
 import PagerView from "react-native-pager-view";
 import Animated, { LinearTransition } from "react-native-reanimated";
-import { SafeAreaView } from "react-native-safe-area-context";
 import { StyleSheet } from "react-native-unistyles";
 
-import { ThemedText } from "@/components/themed-text";
-import { CopyableCommand } from "@/components/ui/copyable-command";
 import { AppToast } from "@/components/ui/toast";
-import { Colors, Fonts, Spacing } from "@/constants/theme";
+import { Colors } from "@/constants/theme";
 import { activeThreadAfterRefresh } from "@/lib/active-thread-selection";
 import {
   getCodexRelayServerUrl,
-  hasCodexRelaySession,
   interruptThreadRun,
-  isPairingQrPayloadError,
   listSkills,
-  pairWithQrPayload,
   refreshSession,
   resolveApproval,
   resolveCodexRelayUrl,
@@ -112,6 +97,7 @@ import {
 import { recordSuccessfulAiConversationForReviewPrompt } from "@/lib/store-review-prompt";
 import { completeThreadRunSession, handleThreadRunStreamEvent } from "@/lib/thread-run-stream";
 import { readCachedWorkspaceRuntimePreferences } from "@/lib/workspace-runtime-preferences-cache";
+import { relayHostIdFromQueryKey } from "@/lib/workspace-file-queries";
 import {
   appendComposerAttachments,
   chatStore$,
@@ -130,13 +116,17 @@ import {
   setComposerDraft,
   setComposerSkills,
   setConnection,
-  setHasPairedSession,
-  setServerUrl,
   setThreadCollaborationMode,
   setThreadMessagesLoading,
   type LocalPromptAttachment,
   type QueuedComposerPrompt,
 } from "@/state/chat-store";
+import {
+  consumePendingNotificationTarget,
+  getActiveHostId,
+  hasPairedHostSession,
+  pairedHostStore$,
+} from "@/state/paired-host-store";
 import { addWorkspacePreviewTab } from "@/state/workspace-preview-store";
 
 import { ChatControls } from "./ChatControls";
@@ -153,7 +143,6 @@ import {
 import { ChatShell } from "./ChatShell";
 import type { ChatShellAction } from "./ChatShellHeader";
 import { ConnectionBanner } from "./ConnectionBanner";
-import { approvalCommand } from "./pairing-commands";
 import {
   EXPANDED_DRAWER_BREAKPOINT,
   THREE_PANE_LAYOUT_BREAKPOINT,
@@ -169,7 +158,6 @@ const CONNECTION_HEALTH_CHECK_MS = 5000;
 const CONNECTION_RETRY_MS = 2500;
 const STREAM_STALL_RECONNECT_MS = 45_000;
 const STREAM_WATCHDOG_INTERVAL_MS = 10_000;
-const SCANNER_TO_APPROVAL_SHEET_DELAY_MS = 450;
 const COPY_TOAST_VISIBLE_MS = 1800;
 const PREVIEW_RESIZE_HANDLE_WIDTH = 14;
 const DEFAULT_PREVIEW_PANE_WIDTH = 540;
@@ -177,25 +165,11 @@ const MIN_CHAT_PANE_WIDTH = 420;
 const MIN_PREVIEW_PANE_WIDTH = 360;
 const EMPTY_SKILLS: AgentSkill[] = [];
 const EMPTY_THREADS: ThreadSummary[] = [];
-let isHandlingPairingLink = false;
-let lastHandledPairingUrl: string | undefined;
-
-type ChatScreenProps = {
-  initialPairingUrl?: string | null;
-};
-
-export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
+export function ChatScreen() {
   const { width } = useWindowDimensions();
   const { isSidebarVisible, toggleSidebar } = useIpadSplitLayout();
-  const [pasteApprovalCode, setPasteApprovalCode] = useState<string | undefined>(undefined);
-  const [pasteApprovalServerUrl, setPasteApprovalServerUrl] = useState<string | undefined>(
-    undefined,
-  );
-  const [isPastePairOpen, setPastePairOpen] = useState(false);
-  const [isPastePairing, setPastePairing] = useState(false);
   const [isAttachingImages, setAttachingImages] = useState(false);
   const composerFocusRequestKey = 0;
-  const [isScannerOpen, setScannerOpen] = useState(false);
   const [isLoadingChanges, setLoadingChanges] = useState(false);
   const [workspaceChanges, setWorkspaceChanges] = useState<WorkspaceChangesResponse | undefined>(
     undefined,
@@ -211,33 +185,35 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   const [markdownPreviewTarget, setMarkdownPreviewTarget] = useState<
     WorkspaceMarkdownPreviewTarget | undefined
   >(undefined);
-  const [isHandlingScan, setHandlingScan] = useState(false);
   const [activePagerPage, setActivePagerPage] = useState(0);
   const [isWidePreviewVisible, setWidePreviewVisible] = useState(true);
   const [wideLayoutWidth, setWideLayoutWidth] = useState(0);
   const [previewPaneWidth, setPreviewPaneWidth] = useState(DEFAULT_PREVIEW_PANE_WIDTH);
-  const [scannerMessage, setScannerMessage] = useState("Point the camera at the connection QR.");
   const copyToastIdRef = useRef(0);
   const runtimePreferencesCoordinator = useMemo(createRuntimePreferencesCoordinator, []);
   const [copyToast, setCopyToast] = useState<{ id: number } | undefined>(undefined);
-  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const usesExpandedSidebar = width >= EXPANDED_DRAWER_BREAKPOINT;
   const usesWideLayout = width >= THREE_PANE_LAYOUT_BREAKPOINT;
   const drawerNavigation = useNavigation<{
     openDrawer?: () => void;
   }>();
   const queryClient = useQueryClient();
+  const activeHostId = useSelector(() => pairedHostStore$.activeHostId.get());
+  const activeHost = useSelector(() =>
+    activeHostId ? pairedHostStore$.hostsById[activeHostId].get() : undefined,
+  );
+  const hasPairedSession = Boolean(activeHost && hasPairedHostSession(activeHostId));
   const fetchCurrentStatus = useCallback(async () => {
     await runtimePreferencesCoordinator.afterUpdates();
-    return fetchStatusState(queryClient);
-  }, [queryClient, runtimePreferencesCoordinator]);
+    return fetchStatusState(queryClient, activeHostId ?? "__unpaired__");
+  }, [activeHostId, queryClient, runtimePreferencesCoordinator]);
   const checkoutWorkspaceBranchMutation = useMutation({
     mutationFn: (body: Parameters<typeof checkoutWorkspaceBranchServerState>[1]) =>
       checkoutWorkspaceBranchServerState(queryClient, body),
     onSuccess: (_response, body) => {
       void queryClient
         .invalidateQueries({
-          queryKey: serverStateKeys.workspaceChanges(body.workspacePath),
+          queryKey: serverStateKeys.workspaceChanges(body.workspacePath, activeHostId),
         })
         .catch(() => undefined);
     },
@@ -248,7 +224,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     onSuccess: (_response, body) => {
       void queryClient
         .invalidateQueries({
-          queryKey: serverStateKeys.workspaceChanges(body.workspacePath),
+          queryKey: serverStateKeys.workspaceChanges(body.workspacePath, activeHostId),
         })
         .catch(() => undefined);
     },
@@ -258,7 +234,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       createThreadServerState(queryClient, body),
     onSuccess: () => {
       void queryClient
-        .invalidateQueries({ queryKey: serverStateKeys.threads() })
+        .invalidateQueries({ queryKey: serverStateKeys.threads(activeHostId) })
         .catch(() => undefined);
     },
   });
@@ -272,11 +248,11 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     onSuccess: (_response, input) => {
       void queryClient
         .invalidateQueries({
-          queryKey: serverStateKeys.queuedInputs(input.threadId),
+          queryKey: serverStateKeys.queuedInputs(input.threadId, activeHostId),
         })
         .catch(() => undefined);
       void queryClient
-        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId) })
+        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId, activeHostId) })
         .catch(() => undefined);
     },
   });
@@ -286,7 +262,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     onMutate: async (input) => {
       const queuedInput = queryClient
         .getQueryData<Awaited<ReturnType<typeof serverStateQueryFns.queuedInputs>>>(
-          serverStateKeys.queuedInputs(input.threadId),
+          serverStateKeys.queuedInputs(input.threadId, activeHostId),
         )
         ?.inputs.find((candidate) => candidate.id === input.inputId);
       if (!queuedInput) {
@@ -305,11 +281,11 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     onSuccess: (_response, input) => {
       void queryClient
         .invalidateQueries({
-          queryKey: serverStateKeys.queuedInputs(input.threadId),
+          queryKey: serverStateKeys.queuedInputs(input.threadId, activeHostId),
         })
         .catch(() => undefined);
       void queryClient
-        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId) })
+        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId, activeHostId) })
         .catch(() => undefined);
     },
   });
@@ -321,7 +297,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       }),
     onSuccess: (_response, input) => {
       void queryClient
-        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId) })
+        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId, activeHostId) })
         .catch(() => undefined);
     },
   });
@@ -330,7 +306,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       clearThreadGoalServerState(queryClient, input.threadId),
     onSuccess: (_response, input) => {
       void queryClient
-        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId) })
+        .invalidateQueries({ queryKey: serverStateKeys.thread(input.threadId, activeHostId) })
         .catch(() => undefined);
     },
   });
@@ -340,8 +316,11 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       threadId: string;
     }) => submitThreadInputServerState(queryClient, input.threadId, input.body),
     onSuccess: (_response, input) => {
-      queryClient.setQueryData(serverStateKeys.thread(input.threadId), (current) => current);
-      queryClient.setQueryData(serverStateKeys.threads(), (current) => current);
+      queryClient.setQueryData(
+        serverStateKeys.thread(input.threadId, activeHostId),
+        (current) => current,
+      );
+      queryClient.setQueryData(serverStateKeys.threads(activeHostId), (current) => current);
     },
   });
   const updateRuntimePreferencesMutation = useMutation({
@@ -350,12 +329,14 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       stage: RuntimePreferencesStage;
     }) {
       return runtimePreferencesCoordinator.enqueue(async () => {
-        await queryClient.cancelQueries({ queryKey: serverStateKeys.status() });
-        return updateRuntimePreferencesServerState(input.body);
+        await queryClient.cancelQueries({
+          queryKey: serverStateKeys.status(activeHostId),
+        });
+        return updateRuntimePreferencesServerState(input.body, activeHostId);
       });
     },
     onSuccess(response, input) {
-      setRuntimePreferencesResponseState(queryClient, response);
+      setRuntimePreferencesResponseState(queryClient, response, activeHostId);
       if (!runtimePreferencesCoordinator.settle(input.stage)) {
         return;
       }
@@ -392,10 +373,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   });
   const pagerRef = useRef<PagerView>(null);
   const isAttachingImagesRef = useRef(false);
-  const isHandlingScanRef = useRef(false);
-  const isModernScannerOpenRef = useRef(false);
   const previewResizeStartWidthRef = useRef(DEFAULT_PREVIEW_PANE_WIDTH);
-  const scanPairingGenerationRef = useRef(0);
   const closeStreamRef = useRef<(() => void) | undefined>(undefined);
   const refreshPromiseRef = useRef<Promise<void> | undefined>(undefined);
   const lastStreamActivityAtRef = useRef(0);
@@ -404,7 +382,6 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   const activeThreadId = useSelector(() => chatStore$.activeThreadId.get());
   const connection = useSelector(() => chatStore$.connection.get());
   const error = useSelector(() => chatStore$.error.get());
-  const hasPairedSession = useSelector(() => chatStore$.hasPairedSession.get());
   const collaborationMode = useSelector(
     () =>
       chatStore$.collaborationModeByThreadId[composerThreadKey(activeThreadId)].get() ??
@@ -413,7 +390,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         : undefined) ??
       "default",
   );
-  const serverUrl = useSelector(() => chatStore$.serverUrl.get());
+  const serverUrl = activeHost?.activeUrl ?? getCodexRelayServerUrl();
   const threadMessagesLoadingByThreadId = useSelector(() =>
     chatStore$.threadMessagesLoadingByThreadId.get(),
   );
@@ -445,21 +422,21 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     queryKey: activeThreadId
       ? serverStateKeys.thread(activeThreadId)
       : [...serverStateKeys.threads(), "__inactive__", "detail"],
-    queryFn: ({ queryKey }) => serverStateQueryFns.thread(String(queryKey[3] ?? "")),
+    queryFn: serverStateQueryFns.thread,
     enabled: Boolean(activeThreadId),
   });
   const queuedInputsQuery = useQuery({
     queryKey: activeThreadId
       ? serverStateKeys.queuedInputs(activeThreadId)
       : [...serverStateKeys.threads(), "__inactive__", "queued-inputs"],
-    queryFn: ({ queryKey }) => serverStateQueryFns.queuedInputs(String(queryKey[3] ?? "")),
+    queryFn: serverStateQueryFns.queuedInputs,
     enabled: Boolean(activeThreadId),
   });
   const contextWindowQuery = useQuery({
     queryKey: activeThreadId
       ? serverStateKeys.contextWindow(activeThreadId)
       : [...serverStateKeys.threads(), "__inactive__", "context-window"],
-    queryFn: ({ queryKey }) => serverStateQueryFns.contextWindow(String(queryKey[3] ?? "")),
+    queryFn: serverStateQueryFns.contextWindow,
     enabled: Boolean(activeThreadId),
   });
 
@@ -484,8 +461,13 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   const isRunningAppThread = activeThread?.source === "app" && activeThread.state === "running";
   const activeWorkspacePath = activeThread?.cwd ?? workspacePath;
   const skillsQuery = useQuery({
-    queryKey: ["codex-relay-skills", serverUrl, activeWorkspacePath ?? null],
-    queryFn: () => listSkills(activeWorkspacePath),
+    queryKey: [
+      "codex-relay",
+      activeHostId ?? "__unpaired__",
+      "skills",
+      activeWorkspacePath ?? null,
+    ],
+    queryFn: ({ queryKey }) => listSkills(activeWorkspacePath, relayHostIdFromQueryKey(queryKey)),
     enabled: Boolean(activeWorkspacePath && hasPairedSession),
     staleTime: 30_000,
   });
@@ -539,9 +521,9 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     : undefined;
   const applyStatusFromServer = useCallback(
     (status: Awaited<ReturnType<typeof serverStateQueryFns.status>>) => {
-      setStatusState(queryClient, status);
+      setStatusState(queryClient, status, activeHostId);
     },
-    [queryClient],
+    [activeHostId, queryClient],
   );
 
   const clearQueuedPrompts = useCallback(
@@ -584,14 +566,13 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   }
 
   const syncPairedSessionState = useCallback(() => {
-    const hasSession = hasCodexRelaySession();
-    setHasPairedSession(hasSession);
+    const hasSession = hasPairedHostSession(activeHostId);
     if (!hasSession) {
-      clearServerState(queryClient);
+      clearServerState(queryClient, activeHostId);
       resetChatSessionState();
     }
     return hasSession;
-  }, [queryClient]);
+  }, [activeHostId, queryClient]);
 
   const clearThreadStatusPoll = useCallback(() => {
     if (!threadStatusPollRef.current) {
@@ -691,13 +672,16 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         ? await safeAsyncValue(() => fetchContextWindowState(queryClient, threadId))
         : undefined;
       if (rateLimitsResponse) {
-        queryClient.setQueryData(serverStateKeys.rateLimits(), rateLimitsResponse);
+        queryClient.setQueryData(serverStateKeys.rateLimits(activeHostId), rateLimitsResponse);
       }
       if (threadId && contextResponse) {
-        queryClient.setQueryData(serverStateKeys.contextWindow(threadId), contextResponse);
+        queryClient.setQueryData(
+          serverStateKeys.contextWindow(threadId, activeHostId),
+          contextResponse,
+        );
       }
     },
-    [queryClient],
+    [activeHostId, queryClient],
   );
 
   const refresh = useCallback(async () => {
@@ -710,7 +694,6 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         setConnection("checking");
       }
       syncPairedSessionState();
-      setServerUrl(getCodexRelayServerUrl());
       try {
         await refreshSession().catch(() => false);
         syncPairedSessionState();
@@ -723,13 +706,18 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
           ]),
           (status) => {
             applyStatusFromServer(status);
-            setConnection("connected");
+            if (getActiveHostId() === activeHostId) {
+              setConnection("connected");
+            }
           },
         );
-        setThreadsState(queryClient, response.threads, response.source);
-        queryClient.setQueryData(serverStateKeys.models(), modelsResponse);
+        if (getActiveHostId() !== activeHostId) {
+          return;
+        }
+        setThreadsState(queryClient, response.threads, response.source, activeHostId);
+        queryClient.setQueryData(serverStateKeys.models(activeHostId), modelsResponse);
         if (rateLimitsResponse) {
-          queryClient.setQueryData(serverStateKeys.rateLimits(), rateLimitsResponse);
+          queryClient.setQueryData(serverStateKeys.rateLimits(activeHostId), rateLimitsResponse);
         }
         const currentActiveThreadId = chatStore$.activeThreadId.peek();
         const hasCurrentActiveThread =
@@ -761,6 +749,9 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
           requestThreadStreamReconnect(nextActiveThreadId);
         }
       } catch (caught) {
+        if (getActiveHostId() !== activeHostId) {
+          return;
+        }
         syncPairedSessionState();
         setConnection("offline", errorMessage(caught));
       }
@@ -774,6 +765,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     return request;
   }, [
     applyStatusFromServer,
+    activeHostId,
     fetchCurrentStatus,
     loadThread,
     queryClient,
@@ -799,7 +791,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
 
   const recoverThreadAfterStreamLoss = useCallback(
     async (threadId: string, fallbackError: string) => {
-      if (hasCodexRelaySession()) {
+      if (hasPairedHostSession(activeHostId)) {
         setConnection("checking");
       }
       await refreshSession().catch(() => false);
@@ -823,6 +815,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       setConnection("offline", fallbackError);
     },
     [
+      activeHostId,
       clearThreadStatusPoll,
       queryClient,
       scheduleThreadStatusPoll,
@@ -871,7 +864,10 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         {},
         {
           onEvent(event) {
-            if (streamGeneration !== streamGenerationRef.current) {
+            if (
+              streamGeneration !== streamGenerationRef.current ||
+              getActiveHostId() !== activeHostId
+            ) {
               return;
             }
             markStreamActivity();
@@ -879,7 +875,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             handleThreadRunStreamEvent(event, {
               fallbackThreadId: threadId,
               applyEvent: (streamEvent) => {
-                applyStreamEventToServerState(queryClient, streamEvent);
+                applyStreamEventToServerState(queryClient, streamEvent, activeHostId);
               },
               onPreviewTarget(previewThreadId, target) {
                 setWebPreviewTargetsByThreadId((current) => ({
@@ -894,9 +890,15 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
                   clearQueuedPrompts,
                   onSuccessfulCompletion: recordSuccessfulAiConversationForReviewPrompt,
                   setQueuedInputs: (queuedThreadId, inputs) =>
-                    setQueuedInputsState(queryClient, queuedThreadId, inputs),
+                    setQueuedInputsState(
+                      queryClient,
+                      queuedThreadId,
+                      inputs,
+                      undefined,
+                      activeHostId,
+                    ),
                   setRunning: (isRunning) =>
-                    setThreadRunningState(queryClient, terminalThreadId, isRunning),
+                    setThreadRunningState(queryClient, terminalThreadId, isRunning, activeHostId),
                   terminalEvent,
                   refreshUsageStatus,
                 });
@@ -904,7 +906,10 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             });
           },
           onError(caught) {
-            if (streamGeneration !== streamGenerationRef.current) {
+            if (
+              streamGeneration !== streamGenerationRef.current ||
+              getActiveHostId() !== activeHostId
+            ) {
               return;
             }
             closeStreamRef.current?.();
@@ -916,7 +921,10 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             void recoverThreadAfterStreamLoss(threadId, caught.message);
           },
           onClose() {
-            if (streamGeneration !== streamGenerationRef.current) {
+            if (
+              streamGeneration !== streamGenerationRef.current ||
+              getActiveHostId() !== activeHostId
+            ) {
               return;
             }
             closeStreamRef.current = undefined;
@@ -940,6 +948,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
       );
     },
     [
+      activeHostId,
       clearThreadStatusPoll,
       clearQueuedPrompts,
       detachCurrentStream,
@@ -1131,16 +1140,19 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
   }
 
   useEffect(() => {
-    setServerUrl(getCodexRelayServerUrl());
+    if (activeHostId) {
+      const target = consumePendingNotificationTarget(activeHostId);
+      if (target) {
+        setActiveThread(target.threadId);
+      }
+    }
     syncPairedSessionState();
     void refresh();
     return () => {
       clearThreadStatusPoll();
       detachCurrentStream();
-      isModernScannerOpenRef.current = false;
-      void CameraView.dismissScanner().catch(() => undefined);
     };
-  }, [clearThreadStatusPoll, detachCurrentStream, refresh, syncPairedSessionState]);
+  }, [activeHostId, clearThreadStatusPoll, detachCurrentStream, refresh, syncPairedSessionState]);
 
   useFocusEffect(
     useCallback(() => {
@@ -1214,205 +1226,6 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     }, CONNECTION_HEALTH_CHECK_MS);
     return () => clearInterval(healthCheck);
   }, [connection, isRunning, keepConnectionIfSessionIsValid]);
-
-  async function openScanner() {
-    if (!cameraPermission?.granted) {
-      const permission = await requestCameraPermission();
-      if (!permission.granted) {
-        setScannerMessage("Camera access is off. Allow camera access to scan the connection QR.");
-        setScannerOpen(true);
-        return;
-      }
-    }
-
-    setHandlingScan(false);
-    isHandlingScanRef.current = false;
-    setScannerMessage("Point the camera at the connection QR.");
-
-    if (CameraView.isModernBarcodeScannerAvailable) {
-      isModernScannerOpenRef.current = true;
-      try {
-        await CameraView.launchScanner({
-          barcodeTypes: ["qr"],
-          isHighlightingEnabled: true,
-        });
-        return;
-      } catch (caught) {
-        isModernScannerOpenRef.current = false;
-        if (isBarcodeScannerCancellation(caught)) {
-          return;
-        }
-      }
-    }
-
-    setScannerOpen(true);
-  }
-
-  async function retryCameraPermission() {
-    const permission = await requestCameraPermission();
-    setScannerMessage(
-      permission.granted
-        ? "Point the camera at the connection QR."
-        : "Camera access is off. Allow camera access to scan the connection QR.",
-    );
-  }
-
-  const handlePairingLink = useCallback(
-    async (url: string | null) => {
-      const pairingUrl = url?.trim();
-      if (
-        !pairingUrl?.startsWith("codex-relay://pair") ||
-        pairingUrl === lastHandledPairingUrl ||
-        isHandlingPairingLink
-      ) {
-        return;
-      }
-
-      isHandlingPairingLink = true;
-      setPastePairing(true);
-      setPasteApprovalCode(undefined);
-      setPasteApprovalServerUrl(undefined);
-      try {
-        const pairing = await pairWithQrPayload(pairingUrl, {
-          onApprovalCode(approvalCode, serverUrl) {
-            setPasteApprovalCode(approvalCode);
-            setPasteApprovalServerUrl(serverUrl);
-            setPastePairOpen(true);
-          },
-        });
-        setServerUrl(pairing.serverUrl);
-        clearServerState(queryClient);
-        syncPairedSessionState();
-        setPastePairOpen(false);
-        lastHandledPairingUrl = pairingUrl;
-        setPasteApprovalCode(undefined);
-        setPasteApprovalServerUrl(undefined);
-        hapticSuccess();
-        await refresh();
-      } catch {
-        Alert.alert("Pairing failed", pairingFailureAlertMessage);
-      } finally {
-        isHandlingPairingLink = false;
-        setPastePairing(false);
-      }
-    },
-    [queryClient, refresh, syncPairedSessionState],
-  );
-
-  useEffect(() => {
-    let isMounted = true;
-    if (initialPairingUrl) {
-      void handlePairingLink(initialPairingUrl);
-    }
-    void Linking.getInitialURL().then((url) => {
-      if (isMounted) {
-        void handlePairingLink(url);
-      }
-    });
-    const unsubscribe = subscribeToPairingLinks(handlePairingLink);
-
-    return () => {
-      isMounted = false;
-      unsubscribe();
-    };
-  }, [handlePairingLink, initialPairingUrl]);
-
-  const closeScannerSurface = useCallback(async () => {
-    const wasModernScannerOpen = isModernScannerOpenRef.current;
-    isModernScannerOpenRef.current = false;
-    setScannerOpen(false);
-    if (wasModernScannerOpen) {
-      await CameraView.dismissScanner().catch(() => undefined);
-    }
-  }, []);
-
-  const presentScannedPairingApproval = useCallback(
-    async (scanPairingGeneration: number, approvalCode: string, serverUrl: string) => {
-      setPasteApprovalCode(approvalCode);
-      setPasteApprovalServerUrl(serverUrl);
-      setScannerMessage(approvalMessage(approvalCode, serverUrl));
-      await closeScannerSurface();
-      await delay(SCANNER_TO_APPROVAL_SHEET_DELAY_MS);
-      if (scanPairingGenerationRef.current === scanPairingGeneration && isHandlingScanRef.current) {
-        setPastePairOpen(true);
-      }
-    },
-    [closeScannerSurface],
-  );
-
-  const handleScanPayload = useCallback(
-    async (payload: unknown) => {
-      if (isHandlingScanRef.current) {
-        return;
-      }
-
-      const scanPairingGeneration = scanPairingGenerationRef.current + 1;
-      scanPairingGenerationRef.current = scanPairingGeneration;
-      isHandlingScanRef.current = true;
-      setHandlingScan(true);
-      setPasteApprovalCode(undefined);
-      setPasteApprovalServerUrl(undefined);
-      setScannerMessage("QR detected. Pairing...");
-      await closeScannerSurface();
-      setPastePairOpen(true);
-      try {
-        const pairing = await pairWithQrPayload(payload, {
-          onApprovalCode(approvalCode, serverUrl) {
-            void presentScannedPairingApproval(scanPairingGeneration, approvalCode, serverUrl);
-          },
-        });
-        scanPairingGenerationRef.current += 1;
-        isHandlingScanRef.current = false;
-        setHandlingScan(false);
-        setServerUrl(pairing.serverUrl);
-        clearServerState(queryClient);
-        syncPairedSessionState();
-        setPastePairOpen(false);
-        setPasteApprovalCode(undefined);
-        setPasteApprovalServerUrl(undefined);
-        await closeScannerSurface();
-        hapticSuccess();
-        await refresh();
-      } catch (caught) {
-        scanPairingGenerationRef.current += 1;
-        await closeScannerSurface();
-        isHandlingScanRef.current = false;
-        setHandlingScan(false);
-        setPastePairOpen(false);
-        setPasteApprovalCode(undefined);
-        setPasteApprovalServerUrl(undefined);
-        const isInvalidPairingQr = isPairingQrPayloadError(caught);
-        setScannerMessage(scannerPairingFailureMessage(caught));
-        Alert.alert(
-          isInvalidPairingQr ? "Invalid QR code" : "Pairing failed",
-          isInvalidPairingQr ? invalidPairingQrAlertMessage : pairingFailureAlertMessage,
-        );
-      }
-    },
-    [
-      closeScannerSurface,
-      presentScannedPairingApproval,
-      queryClient,
-      refresh,
-      syncPairedSessionState,
-    ],
-  );
-
-  function handleBarcodeScanned(result: BarcodeScanningResult | ScanningResult) {
-    void handleScanPayload(readScannedPayload(result));
-  }
-
-  useEffect(() => {
-    const barcodeScanListener = CameraView.onModernBarcodeScanned((result) => {
-      if (!isModernScannerOpenRef.current) {
-        return;
-      }
-
-      void handleScanPayload(readScannedPayload(result));
-    });
-
-    return () => barcodeScanListener.remove();
-  }, [handleScanPayload]);
 
   async function sendPrompt(
     promptOverride?: string,
@@ -1581,7 +1394,10 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
         },
         {
           onEvent(event) {
-            if (streamGeneration !== streamGenerationRef.current) {
+            if (
+              streamGeneration !== streamGenerationRef.current ||
+              getActiveHostId() !== activeHostId
+            ) {
               return;
             }
             markStreamActivity();
@@ -1592,7 +1408,7 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             handleThreadRunStreamEvent(event, {
               fallbackThreadId: runThreadId,
               applyEvent: (streamEvent) => {
-                applyStreamEventToServerState(queryClient, streamEvent);
+                applyStreamEventToServerState(queryClient, streamEvent, activeHostId);
               },
               onPreviewTarget(previewThreadId, target) {
                 setWebPreviewTargetsByThreadId((current) => ({
@@ -1607,9 +1423,15 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
                   clearQueuedPrompts,
                   onSuccessfulCompletion: recordSuccessfulAiConversationForReviewPrompt,
                   setQueuedInputs: (queuedThreadId, inputs) =>
-                    setQueuedInputsState(queryClient, queuedThreadId, inputs),
+                    setQueuedInputsState(
+                      queryClient,
+                      queuedThreadId,
+                      inputs,
+                      undefined,
+                      activeHostId,
+                    ),
                   setRunning: (isRunning) =>
-                    setThreadRunningState(queryClient, terminalThreadId, isRunning),
+                    setThreadRunningState(queryClient, terminalThreadId, isRunning, activeHostId),
                   terminalEvent,
                   refreshUsageStatus,
                 });
@@ -1617,7 +1439,10 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             });
           },
           onError(caught) {
-            if (streamGeneration !== streamGenerationRef.current) {
+            if (
+              streamGeneration !== streamGenerationRef.current ||
+              getActiveHostId() !== activeHostId
+            ) {
               return;
             }
             closeStreamRef.current?.();
@@ -1631,7 +1456,10 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             void recoverPromptRunAfterEarlyStreamLoss(runThreadId, caught.message, restorePrompt);
           },
           onClose() {
-            if (streamGeneration !== streamGenerationRef.current) {
+            if (
+              streamGeneration !== streamGenerationRef.current ||
+              getActiveHostId() !== activeHostId
+            ) {
               return;
             }
             closeStreamRef.current = undefined;
@@ -2115,7 +1943,8 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     const workspacePreferences =
       status?.runtimePreferencesByWorkspacePath[targetWorkspacePath] ??
       (status?.workspacePath === targetWorkspacePath ? status.preferences : undefined) ??
-      readCachedWorkspaceRuntimePreferences(getCodexRelayServerUrl(), targetWorkspacePath);
+      readCachedWorkspaceRuntimePreferences(activeHostId ?? serverUrl, targetWorkspacePath) ??
+      readCachedWorkspaceRuntimePreferences(serverUrl, targetWorkspacePath);
     return workspacePreferences;
   }
 
@@ -2193,7 +2022,6 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
     setCopyToast({ id: copyToastIdRef.current });
   }, []);
 
-  const isPairing = isPastePairing || isHandlingScan;
   const isWorkspacePreviewVisible = usesWideLayout
     ? showsWidePreviewPane
     : hasPairedSession && activePagerPage === 1;
@@ -2233,7 +2061,8 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
             serverUrl={serverUrl}
             workspacePath={workspacePath}
             onRefresh={refresh}
-            onScanConnect={openScanner}
+            onScanConnect={() => router.push("/pair")}
+            onSwitchComputer={openThreadDrawer}
           />
         </Animated.View>
       }
@@ -2390,137 +2219,6 @@ export function ChatScreen({ initialPairingUrl }: ChatScreenProps = {}) {
           }
         />
       ) : null}
-      <Modal
-        animationType="slide"
-        onRequestClose={() => setPastePairOpen(false)}
-        presentationStyle="pageSheet"
-        visible={isPastePairOpen}
-      >
-        <SafeAreaView edges={["top", "left", "right"]} style={styles.manualScreen}>
-          <View style={styles.manualPanel}>
-            <View style={styles.manualHeader}>
-              <ThemedText type="smallBold" style={styles.manualTitle}>
-                {pasteApprovalCode ? "Approve this phone" : "Pairing"}
-              </ThemedText>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Close pairing status"
-                onPress={() => setPastePairOpen(false)}
-                style={({ pressed }) => [styles.manualButtonSecondary, pressed && styles.pressed]}
-              >
-                <ThemedText type="smallBold">Close</ThemedText>
-              </Pressable>
-            </View>
-            <View style={styles.manualFields}>
-              <ThemedText type="small" themeColor="textSecondary">
-                {pasteApprovalCode
-                  ? "Finish pairing from the Terminal window where codex-relay is running."
-                  : "QR recognized. Connecting to the relay..."}
-              </ThemedText>
-              {pasteApprovalCode ? (
-                <View style={styles.manualApproval}>
-                  <ThemedText type="smallBold">Approval code</ThemedText>
-                  <ThemedText selectable style={styles.manualApprovalCode}>
-                    {pasteApprovalCode}
-                  </ThemedText>
-                  <ThemedText type="small" themeColor="textSecondary">
-                    Run this on your computer:
-                  </ThemedText>
-                  <CopyableCommand
-                    command={approvalCommand(pasteApprovalCode, pasteApprovalServerUrl)}
-                    copyAccessibilityLabel="Copy approval command"
-                    textStyle={styles.manualApprovalCommand}
-                  />
-                </View>
-              ) : null}
-            </View>
-            <View style={styles.manualStatus}>
-              <ThemedText type="smallBold" style={styles.manualStatusText}>
-                {pasteApprovalCode ? "Waiting for approval" : isPairing ? "Pairing" : "Ready"}
-              </ThemedText>
-            </View>
-          </View>
-        </SafeAreaView>
-      </Modal>
-      <Modal
-        animationType="slide"
-        onRequestClose={() => setScannerOpen(false)}
-        presentationStyle="fullScreen"
-        visible={isScannerOpen}
-      >
-        <View style={styles.scannerScreen}>
-          {cameraPermission?.granted ? (
-            <CameraView
-              active={isScannerOpen}
-              barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
-              facing="back"
-              onBarcodeScanned={isHandlingScan ? undefined : handleBarcodeScanned}
-              style={styles.camera}
-            />
-          ) : (
-            <View style={styles.scannerPermissionPanel}>
-              <View
-                accessible
-                accessibilityLabel="Camera access is off. Allow camera access to scan the connection QR."
-                style={styles.scannerPermissionCard}
-              >
-                <ThemedText type="smallBold" style={styles.scannerPermissionTitle}>
-                  Camera access is off
-                </ThemedText>
-                <ThemedText
-                  type="small"
-                  themeColor="textSecondary"
-                  style={styles.scannerPermissionCopy}
-                >
-                  Allow camera access to scan the connection QR, or close this screen and pair
-                  another way.
-                </ThemedText>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityLabel={
-                    cameraPermission?.canAskAgain === false
-                      ? "Open app settings for camera access"
-                      : "Try camera permission again"
-                  }
-                  onPress={
-                    cameraPermission?.canAskAgain === false
-                      ? () => void Linking.openSettings()
-                      : () => void retryCameraPermission()
-                  }
-                  style={({ pressed }) => [
-                    styles.scannerPermissionAction,
-                    pressed && styles.pressed,
-                  ]}
-                >
-                  <ThemedText type="smallBold" style={styles.scannerPermissionActionText}>
-                    {cameraPermission?.canAskAgain === false ? "Open Settings" : "Try Again"}
-                  </ThemedText>
-                </Pressable>
-              </View>
-            </View>
-          )}
-          <SafeAreaView edges={["top", "left", "right"]} style={styles.scannerOverlay}>
-            <View style={styles.scannerHeader}>
-              <ThemedText type="smallBold" style={styles.scannerTitle}>
-                {isHandlingScan ? "Pairing" : "Scan connection QR"}
-              </ThemedText>
-              <Pressable
-                accessibilityRole="button"
-                accessibilityLabel="Close QR scanner"
-                onPress={() => setScannerOpen(false)}
-                style={({ pressed }) => [styles.scannerClose, pressed && styles.pressed]}
-              >
-                <ThemedText type="smallBold">Close</ThemedText>
-              </Pressable>
-            </View>
-            <View style={styles.scannerFooter}>
-              <ThemedText type="smallBold" style={styles.scannerMessage}>
-                {scannerMessage}
-              </ThemedText>
-            </View>
-          </SafeAreaView>
-        </View>
-      </Modal>
     </>
   );
 }
@@ -2711,13 +2409,6 @@ function agentSkillsFromPromptSkills(skills: ApiPromptSkill[], availableSkills: 
   });
 }
 
-function subscribeToPairingLinks(onUrl: (url: string) => void) {
-  const urlListener = Linking.addEventListener("url", (event) => {
-    onUrl(event.url);
-  });
-  return () => urlListener.remove();
-}
-
 function mergeAgentSkills(currentSkills: AgentSkill[], nextSkills: AgentSkill[]) {
   const seen = new Set(currentSkills.map(agentSkillKey));
   const merged = [...currentSkills];
@@ -2791,56 +2482,12 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unable to reach the Codex Relay server.";
 }
 
-function scannerPairingFailureMessage(error: unknown) {
-  return isPairingQrPayloadError(error)
-    ? "This is not the Codex Relay QR. Scan the QR shown on your computer."
-    : "Could not connect. Use the same Wi-Fi or turn on Tailscale, then scan again.";
-}
-
-const invalidPairingQrAlertMessage =
-  "Run npx codex-relay@latest on your computer, then scan the QR shown there.";
-
-const pairingFailureAlertMessage =
-  "Use the same Wi-Fi on your phone and computer. If that is not possible, turn on Tailscale on both devices and scan again.";
-
 async function safeAsyncValue<T>(callback: () => Promise<T>) {
   try {
     return await callback();
   } catch {
     return undefined;
   }
-}
-
-function delay(ms: number) {
-  return new Promise<void>((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
-function approvalMessage(approvalCode: string, serverUrl?: string) {
-  return `Run ${approvalCommand(approvalCode, serverUrl)} in the server terminal.`;
-}
-
-function readScannedPayload(result: unknown) {
-  if (!result || typeof result !== "object") {
-    return undefined;
-  }
-
-  const record = result as Record<string, unknown>;
-  const nativeEvent = record.nativeEvent;
-  if (nativeEvent && typeof nativeEvent === "object") {
-    return readScannedPayload(nativeEvent);
-  }
-
-  return typeof record.data === "string"
-    ? record.data
-    : typeof record.raw === "string"
-      ? record.raw
-      : undefined;
-}
-
-function isBarcodeScannerCancellation(error: unknown) {
-  return error instanceof Error && error.message.toLowerCase().includes("cancel");
 }
 
 function clampPreviewPaneWidth(value: number, layoutWidth: number) {
@@ -2901,154 +2548,5 @@ const styles = StyleSheet.create({
   },
   bannerStack: {
     flexShrink: 0,
-  },
-  scannerScreen: {
-    backgroundColor: Colors.dark.background,
-    flex: 1,
-  },
-  camera: {
-    ...StyleSheet.absoluteFillObject,
-  },
-  scannerOverlay: {
-    flex: 1,
-    justifyContent: "space-between",
-  },
-  scannerHeader: {
-    alignItems: "center",
-    flexDirection: "row",
-    justifyContent: "space-between",
-    paddingHorizontal: Spacing.four,
-    paddingTop: Spacing.three,
-  },
-  scannerTitle: {
-    backgroundColor: "rgba(42, 42, 42, 0.78)",
-    borderColor: "rgba(255, 255, 255, 0.14)",
-    borderRadius: 18,
-    borderWidth: 1,
-    overflow: "hidden",
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-  },
-  scannerClose: {
-    backgroundColor: "rgba(42, 42, 42, 0.78)",
-    borderColor: "rgba(255, 255, 255, 0.14)",
-    borderRadius: 18,
-    borderWidth: 1,
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-  },
-  scannerFooter: {
-    alignItems: "center",
-    gap: Spacing.three,
-    paddingBottom: Spacing.four,
-    paddingHorizontal: Spacing.four,
-  },
-  scannerMessage: {
-    backgroundColor: "rgba(42, 42, 42, 0.78)",
-    borderColor: "rgba(255, 255, 255, 0.14)",
-    borderRadius: 18,
-    borderWidth: 1,
-    overflow: "hidden",
-    paddingHorizontal: Spacing.three,
-    paddingVertical: Spacing.two,
-    textAlign: "center",
-  },
-  scannerPermissionPanel: {
-    ...StyleSheet.absoluteFillObject,
-    alignItems: "center",
-    justifyContent: "center",
-    padding: Spacing.four,
-  },
-  scannerPermissionCard: {
-    backgroundColor: Colors.dark.backgroundElement,
-    borderColor: "rgba(255, 255, 255, 0.14)",
-    borderRadius: 8,
-    borderWidth: 1,
-    gap: Spacing.three,
-    maxWidth: 340,
-    padding: Spacing.four,
-    width: "100%",
-  },
-  scannerPermissionTitle: {
-    fontSize: 17,
-    lineHeight: 22,
-    textAlign: "center",
-  },
-  scannerPermissionCopy: {
-    textAlign: "center",
-  },
-  scannerPermissionAction: {
-    alignItems: "center",
-    backgroundColor: "rgba(255, 255, 255, 0.08)",
-    borderColor: "rgba(132, 145, 165, 0.24)",
-    borderRadius: 8,
-    borderWidth: 1,
-    minHeight: 40,
-    justifyContent: "center",
-    paddingHorizontal: Spacing.three,
-  },
-  scannerPermissionActionText: {
-    color: Colors.dark.text,
-  },
-  manualScreen: {
-    backgroundColor: Colors.dark.background,
-    flex: 1,
-  },
-  manualPanel: {
-    gap: Spacing.three,
-    padding: Spacing.four,
-  },
-  manualHeader: {
-    alignItems: "center",
-    flexDirection: "row",
-    justifyContent: "space-between",
-  },
-  manualTitle: {
-    fontSize: 20,
-    lineHeight: 26,
-  },
-  manualFields: {
-    gap: Spacing.two,
-  },
-  manualApproval: {
-    backgroundColor: "rgba(255, 255, 255, 0.06)",
-    borderColor: "rgba(255, 255, 255, 0.12)",
-    borderRadius: 8,
-    borderWidth: 1,
-    gap: Spacing.two,
-    padding: Spacing.three,
-  },
-  manualApprovalCode: {
-    color: Colors.dark.text,
-    fontFamily: Fonts.monoMedium,
-    fontSize: 24,
-    lineHeight: 30,
-  },
-  manualApprovalCommand: {
-    color: Colors.dark.text,
-    fontFamily: Fonts.monoMedium,
-    fontSize: 13,
-    lineHeight: 18,
-  },
-  manualButtonSecondary: {
-    backgroundColor: "rgba(255, 255, 255, 0.08)",
-    borderColor: "rgba(132, 145, 165, 0.24)",
-    borderRadius: 13,
-    borderWidth: 1,
-    paddingHorizontal: Spacing.two,
-    paddingVertical: Spacing.one,
-  },
-  manualStatus: {
-    alignItems: "center",
-    backgroundColor: "rgba(255, 255, 255, 0.08)",
-    borderColor: "rgba(255, 255, 255, 0.12)",
-    borderRadius: 8,
-    borderWidth: 1,
-    minHeight: 48,
-    justifyContent: "center",
-  },
-  manualStatusText: {
-    fontSize: 14,
-    lineHeight: 18,
   },
 });

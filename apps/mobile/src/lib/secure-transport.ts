@@ -14,6 +14,8 @@ import {
 import { fromByteArray, toByteArray } from "base64-js";
 import { createMMKV } from "react-native-mmkv";
 
+import { getActiveHostId } from "../state/paired-host-store";
+
 const secureProtocolVersion = 1;
 const handshakeTag = "codex-relay-e2ee-v1";
 const storage = createMMKV({ id: "codex-relay-secure" });
@@ -22,6 +24,7 @@ const mobileToServerKeyStorageKey = "mobile-to-server-key";
 const serverToMobileKeyStorageKey = "server-to-mobile-key";
 const nextMobileCounterStorageKey = "next-mobile-counter";
 const lastServerCounterStorageKey = "last-server-counter";
+const hostStorageKey = (hostId: string, key: string) => `host.${hostId}.${key}`;
 
 export type SecurePairingAttempt = {
   approvalCode?: string;
@@ -95,12 +98,11 @@ export function completeSecurePairing(attempt: SecurePairingAttempt, response: P
     response.secure.encryptedPayload,
   );
   const payload = PairEncryptedPayloadSchema.parse(JSON.parse(decrypted));
-  saveSecureSession(session);
-  return payload;
+  return { payload, session };
 }
 
-export function encryptRequestPayload(payload: unknown) {
-  const session = readSecureSession();
+export function encryptRequestPayload(payload: unknown, hostId = getActiveHostId()) {
+  const session = readSecureSession(hostId);
   if (!session) {
     return JSON.stringify(payload);
   }
@@ -113,12 +115,12 @@ export function encryptRequestPayload(payload: unknown) {
     JSON.stringify(payload),
   );
   session.nextMobileCounter += 1;
-  saveSecureSession(session);
+  saveSecureSession(hostId!, session);
   return JSON.stringify(EncryptedPayloadSchema.parse(envelope));
 }
 
-export function decryptResponsePayload(payload: unknown) {
-  const session = readSecureSession();
+export function decryptResponsePayload(payload: unknown, hostId = getActiveHostId()) {
+  const session = readSecureSession(hostId);
   const envelope = EncryptedPayloadSchema.safeParse(payload);
   if (!session || !envelope.success) {
     return payload;
@@ -138,12 +140,21 @@ export function decryptResponsePayload(payload: unknown) {
     envelope.data.ciphertext,
   );
   session.lastServerCounter = envelope.data.counter;
-  saveSecureSession(session);
+  saveSecureSession(hostId!, session);
   return JSON.parse(decrypted);
 }
 
-export function clearSecureSession() {
-  storage.clearAll();
+export function clearSecureSession(hostId = getActiveHostId()) {
+  if (!hostId) {
+    return;
+  }
+  for (const key of secureSessionStorageKeys) {
+    storage.remove(hostStorageKey(hostId, key));
+  }
+}
+
+export function persistSecureSession(hostId: string, session: SecureSession) {
+  saveSecureSession(hostId, session);
 }
 
 function deriveSession(
@@ -233,30 +244,76 @@ function nonceFor(sender: "mobile" | "server", counter: number) {
   return nonce;
 }
 
-function saveSecureSession(session: SecureSession) {
-  storage.set(keyEpochStorageKey, session.keyEpoch);
-  storage.set(mobileToServerKeyStorageKey, bytesToBase64(session.mobileToServerKey));
-  storage.set(serverToMobileKeyStorageKey, bytesToBase64(session.serverToMobileKey));
-  storage.set(nextMobileCounterStorageKey, session.nextMobileCounter);
-  storage.set(lastServerCounterStorageKey, session.lastServerCounter);
+function saveSecureSession(hostId: string, session: SecureSession) {
+  storage.set(hostStorageKey(hostId, keyEpochStorageKey), session.keyEpoch);
+  storage.set(
+    hostStorageKey(hostId, mobileToServerKeyStorageKey),
+    bytesToBase64(session.mobileToServerKey),
+  );
+  storage.set(
+    hostStorageKey(hostId, serverToMobileKeyStorageKey),
+    bytesToBase64(session.serverToMobileKey),
+  );
+  storage.set(hostStorageKey(hostId, nextMobileCounterStorageKey), session.nextMobileCounter);
+  storage.set(hostStorageKey(hostId, lastServerCounterStorageKey), session.lastServerCounter);
 }
 
-function readSecureSession() {
-  const mobileToServerKey = storage.getString(mobileToServerKeyStorageKey);
-  const serverToMobileKey = storage.getString(serverToMobileKeyStorageKey);
-  const keyEpoch = storage.getNumber(keyEpochStorageKey);
+function readSecureSession(hostId: string | undefined) {
+  if (!hostId) {
+    return undefined;
+  }
+  const mobileToServerKey = storage.getString(hostStorageKey(hostId, mobileToServerKeyStorageKey));
+  const serverToMobileKey = storage.getString(hostStorageKey(hostId, serverToMobileKeyStorageKey));
+  const keyEpoch = storage.getNumber(hostStorageKey(hostId, keyEpochStorageKey));
   if (!mobileToServerKey || !serverToMobileKey || keyEpoch === undefined) {
     return undefined;
   }
 
   return {
     keyEpoch,
-    lastServerCounter: storage.getNumber(lastServerCounterStorageKey) ?? 0,
+    lastServerCounter: storage.getNumber(hostStorageKey(hostId, lastServerCounterStorageKey)) ?? 0,
     mobileToServerKey: base64ToBytes(mobileToServerKey),
-    nextMobileCounter: storage.getNumber(nextMobileCounterStorageKey) ?? 0,
+    nextMobileCounter: storage.getNumber(hostStorageKey(hostId, nextMobileCounterStorageKey)) ?? 0,
     serverToMobileKey: base64ToBytes(serverToMobileKey),
   };
 }
+
+const secureSessionStorageKeys = [
+  keyEpochStorageKey,
+  mobileToServerKeyStorageKey,
+  serverToMobileKeyStorageKey,
+  nextMobileCounterStorageKey,
+  lastServerCounterStorageKey,
+] as const;
+
+function migrateLegacySecureSession() {
+  const hostId = getActiveHostId();
+  if (!hostId || storage.getNumber(hostStorageKey(hostId, keyEpochStorageKey)) !== undefined) {
+    return;
+  }
+  const keyEpoch = storage.getNumber(keyEpochStorageKey);
+  const mobileToServerKey = storage.getString(mobileToServerKeyStorageKey);
+  const serverToMobileKey = storage.getString(serverToMobileKeyStorageKey);
+  if (keyEpoch === undefined || !mobileToServerKey || !serverToMobileKey) {
+    return;
+  }
+  storage.set(hostStorageKey(hostId, keyEpochStorageKey), keyEpoch);
+  storage.set(hostStorageKey(hostId, mobileToServerKeyStorageKey), mobileToServerKey);
+  storage.set(hostStorageKey(hostId, serverToMobileKeyStorageKey), serverToMobileKey);
+  storage.set(
+    hostStorageKey(hostId, nextMobileCounterStorageKey),
+    storage.getNumber(nextMobileCounterStorageKey) ?? 0,
+  );
+  storage.set(
+    hostStorageKey(hostId, lastServerCounterStorageKey),
+    storage.getNumber(lastServerCounterStorageKey) ?? 0,
+  );
+  for (const key of secureSessionStorageKeys) {
+    storage.remove(key);
+  }
+}
+
+migrateLegacySecureSession();
 
 function bytesToBase64(bytes: Uint8Array) {
   return fromByteArray(bytes);

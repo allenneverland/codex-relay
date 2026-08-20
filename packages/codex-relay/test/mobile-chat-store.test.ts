@@ -6,6 +6,7 @@ import {
   applyStreamEvent,
   chatStore$,
   clearQueuedPrompts,
+  composerThreadKey,
   getCollaborationMode,
   moveNewThreadCollaborationMode,
   mergeActiveThreadInto,
@@ -288,11 +289,15 @@ describe("mobile chat store stream handling", () => {
     expect(chatStore$.messagesByThreadId[sdkThread.id].peek()).toEqual([
       expect.objectContaining({ threadId: sdkThread.id, content: "hello" }),
     ]);
-    expect(chatStore$.composerDraftByThreadId[localThread.id].peek()).toBeUndefined();
-    expect(chatStore$.composerDraftByThreadId[sdkThread.id].peek()).toBe("next prompt");
-    expect(chatStore$.composerAttachmentsByThreadId[sdkThread.id].peek()).toEqual([
-      attachment("image-1"),
-    ]);
+    expect(
+      chatStore$.composerDraftByThreadId[composerThreadKey(localThread.id)].peek(),
+    ).toBeUndefined();
+    expect(chatStore$.composerDraftByThreadId[composerThreadKey(sdkThread.id)].peek()).toBe(
+      "next prompt",
+    );
+    expect(
+      chatStore$.composerAttachmentsByThreadId[composerThreadKey(sdkThread.id)].peek(),
+    ).toEqual([attachment("image-1")]);
     expect(getCollaborationMode(sdkThread.id)).toBe("plan");
     expect(chatStore$.contextUsageByThreadId[sdkThread.id].peek()).toEqual({
       tokenLimit: 100,

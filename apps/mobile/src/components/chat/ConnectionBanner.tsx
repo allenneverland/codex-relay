@@ -18,6 +18,7 @@ export function ConnectionBanner({
   hasPairedSession,
   onRefresh,
   onScanConnect,
+  onSwitchComputer,
   serverUrl,
   workspacePath,
 }: {
@@ -26,6 +27,7 @@ export function ConnectionBanner({
   hasPairedSession: boolean;
   onRefresh: () => void;
   onScanConnect: () => void;
+  onSwitchComputer: () => void;
   serverUrl: string;
   workspacePath?: string;
 }) {
@@ -70,6 +72,43 @@ export function ConnectionBanner({
               </ThemedText>
             </View>
           </View>
+          {connection === "offline" ? (
+            <View style={styles.pairActions}>
+              <Button
+                accessibilityLabel="Retry connection"
+                onPress={onRefresh}
+                size="lg"
+                variant="default"
+                className="h-11 rounded-lg"
+                style={styles.pairButton}
+              >
+                <Icon name="refresh" size={16} tintColor="#141414" />
+                <ThemedText type="smallBold" style={styles.primaryActionText}>
+                  Retry
+                </ThemedText>
+              </Button>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Switch computer"
+                onPress={onSwitchComputer}
+                style={({ pressed }) => [styles.refreshAction, pressed && styles.pressed]}
+              >
+                <ThemedText type="smallBold" themeColor="textSecondary" style={styles.refreshText}>
+                  Switch computer
+                </ThemedText>
+              </Pressable>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Pair another computer"
+                onPress={onScanConnect}
+                style={({ pressed }) => [styles.refreshAction, pressed && styles.pressed]}
+              >
+                <ThemedText type="smallBold" themeColor="textSecondary" style={styles.refreshText}>
+                  Pair another computer
+                </ThemedText>
+              </Pressable>
+            </View>
+          ) : null}
         </Animated.View>
       </Animated.View>
     );
