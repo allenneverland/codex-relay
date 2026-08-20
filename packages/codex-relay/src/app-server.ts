@@ -323,8 +323,17 @@ export class CodexAppServerClient {
   }
 
   async listLoadedThreads() {
-    const response = await this.request<{ data: AppServerThread[] }>("thread/loaded/list", null);
-    return response.data;
+    const response = await this.request<{ data: Array<AppServerThread | string> }>(
+      "thread/loaded/list",
+      {},
+    );
+    return Promise.all(
+      response.data.map((thread) =>
+        typeof thread === "string"
+          ? this.readThread(thread, { includeTurns: false })
+          : Promise.resolve(thread),
+      ),
+    );
   }
 
   async readThread(threadId: string, options: { includeTurns?: boolean } = {}) {
