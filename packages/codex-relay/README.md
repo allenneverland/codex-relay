@@ -165,16 +165,13 @@ PORT=8788 npx codex-relay@latest
 CODEX_RELAY_WORKSPACE_PATH=/path/to/project npx codex-relay@latest
 ```
 
-For direct iOS notifications, configure the APNs provider before starting the relay:
+For direct iOS notifications, configure the APNs provider before starting the relay. The CLI automatically reads `.codex-relay/apns.env` from the directory where it is started (or the path in `CODEX_RELAY_APNS_ENV_PATH`):
 
 ```sh
-CODEX_RELAY_APNS_KEY_PATH=/absolute/path/AuthKey_ABC123.p8 \
-CODEX_RELAY_APNS_KEY_ID=ABC123 \
-CODEX_RELAY_APNS_TEAM_ID=TEAM123 \
 npx codex-relay@latest --shared-app-server --bg
 ```
 
-The `.p8` file is read from disk and is never stored in the relay database. The Mac must remain awake and online for background delivery attempts.
+Environment variables already set in the shell take precedence over values in the file. The `.p8` file is read from disk and is never stored in the relay database. The Mac must remain awake and online for background delivery attempts.
 
 ## Network Notes
 

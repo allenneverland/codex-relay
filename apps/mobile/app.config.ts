@@ -12,8 +12,12 @@ export default function appConfig(_context: ConfigContext): ExpoConfig {
     ios: {
       icon: "./assets/images/icon.png",
       bundleIdentifier: "com.allenneverland.codexrelay",
+      entitlements: {
+        "aps-environment": "development",
+      },
       supportsTablet: true,
       infoPlist: {
+        NSBonjourServices: ["_expo._tcp"],
         NSAppTransportSecurity: {
           NSAllowsArbitraryLoads: true,
           NSAllowsLocalNetworking: true,

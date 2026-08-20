@@ -124,7 +124,7 @@ After pairing, open **Settings > Notifications** in the mobile app and enable ei
 - **Turn complete** for completed or failed Codex turns
 - **Action required** for approval and input requests
 
-The relay sends direct APNs alerts containing only generic text plus opaque event, thread, and turn identifiers. It does not send prompts, responses, commands, or approval text. Configure `CODEX_RELAY_APNS_KEY_PATH`, `CODEX_RELAY_APNS_KEY_ID`, and `CODEX_RELAY_APNS_TEAM_ID`, then keep the relay running with `npx codex-relay@latest --shared-app-server --bg`. The APNs topic defaults to `com.allenneverland.codexrelay`.
+The relay sends direct APNs alerts containing only generic text plus opaque event, thread, and turn identifiers. It does not send prompts, responses, commands, or approval text. Configure `CODEX_RELAY_APNS_KEY_PATH`, `CODEX_RELAY_APNS_KEY_ID`, and `CODEX_RELAY_APNS_TEAM_ID`. When running from this repository, put them in `.codex-relay/apns.env` and start the local implementation with `pnpm relay:bg`. The APNs topic defaults to `com.allenneverland.codexrelay`.
 
 Push support requires a development-signed native iOS build with the Push Notifications capability. An OTA update alone cannot add the entitlement or change the bundle ID.
 

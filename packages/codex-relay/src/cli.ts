@@ -6,6 +6,7 @@ import { spawn } from "node:child_process";
 import { closeSync, openSync } from "node:fs";
 import { access, mkdir, readFile, rm, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
+import { loadEnvFile } from "node:process";
 import { setTimeout } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
@@ -63,6 +64,8 @@ Examples:
   ${npxCommand} approve CODE Approve a pending mobile pairing request`,
   )
   .action(async (options) => {
+    await loadLocalApnsEnvironment();
+
     if (options.debug) {
       process.env.CODEX_RELAY_DEBUG = "1";
     }
@@ -115,6 +118,19 @@ program
   });
 
 await program.parseAsync();
+
+async function loadLocalApnsEnvironment() {
+  const envPath =
+    process.env.CODEX_RELAY_APNS_ENV_PATH?.trim() || legacyCodexRelayDataPath("apns.env");
+
+  if (!(await pathExists(envPath))) {
+    return;
+  }
+
+  const existingEnvironment = { ...process.env };
+  loadEnvFile(envPath);
+  Object.assign(process.env, existingEnvironment);
+}
 
 async function startBackgroundServer() {
   const logPath = codexRelayDataPath("server.log");
