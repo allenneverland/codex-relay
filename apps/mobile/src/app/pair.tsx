@@ -1,7 +1,16 @@
 import { CameraView, useCameraPermissions } from "expo-camera";
-import { router, useLocalSearchParams } from "expo-router";
+import * as Clipboard from "expo-clipboard";
+import { router, useFocusEffect, useLocalSearchParams } from "expo-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, Alert, Linking, Pressable, View } from "react-native";
+import {
+  ActivityIndicator,
+  Alert,
+  AppState,
+  Linking,
+  Platform,
+  Pressable,
+  View,
+} from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { StyleSheet } from "react-native-unistyles";
 
@@ -20,51 +29,152 @@ export default function PairScreen() {
   const initialPairingUrl = useMemo(() => pairingUrlFromParams(params), [params]);
   const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const pairingRef = useRef(false);
+  const nativeScannerOpenRef = useRef(false);
+  const resumeNativeScannerRef = useRef(false);
+  const didAutoLaunchScannerRef = useRef(false);
   const handledInitialUrlRef = useRef<string | undefined>(undefined);
   const [approval, setApproval] = useState<{ code: string; serverUrl: string } | undefined>();
+  const [appState, setAppState] = useState(AppState.currentState);
+  const [isEmbeddedScannerVisible, setEmbeddedScannerVisible] = useState(false);
+  const [isFocused, setFocused] = useState(false);
   const [isApprovalVisible, setApprovalVisible] = useState(false);
   const [isPairing, setPairing] = useState(false);
-  const [message, setMessage] = useState("Point the camera at the connection QR.");
+  const [message, setMessage] = useState("Scan the connection QR or paste its pairing link.");
 
-  const pair = useCallback(async (payload: unknown) => {
-    if (pairingRef.current) {
-      return;
-    }
-    pairingRef.current = true;
-    setPairing(true);
-    setMessage("QR detected. Connecting…");
-    try {
-      await pairWithQrPayload(payload, {
-        onApprovalCode(code, serverUrl) {
-          setApproval({ code, serverUrl });
-          setApprovalVisible(true);
-          setMessage("Approve this phone from the relay terminal.");
-        },
-      });
-      hapticSuccess();
-      resetChatSessionState();
-      setConnection("checking");
-      router.replace("/");
-    } catch (caught) {
-      pairingRef.current = false;
-      setPairing(false);
-      setApproval(undefined);
-      setApprovalVisible(false);
-      const invalidQr = isPairingQrPayloadError(caught);
-      setMessage(
-        invalidQr
-          ? "This is not a Codex Relay QR. Scan the QR shown on your computer."
-          : "Could not connect. Check Wi-Fi or Tailscale, then scan again.",
-      );
-      hapticWarning();
-      Alert.alert(
-        invalidQr ? "Invalid QR code" : "Pairing failed",
-        invalidQr
-          ? "Run npx codex-relay@latest on your computer, then scan the QR shown there."
-          : "Use the same Wi-Fi on both devices, or turn on Tailscale and try again.",
-      );
+  const dismissNativeScanner = useCallback(async () => {
+    const wasOpen = nativeScannerOpenRef.current;
+    nativeScannerOpenRef.current = false;
+    if (wasOpen && CameraView.isModernBarcodeScannerAvailable) {
+      await CameraView.dismissScanner().catch(() => undefined);
     }
   }, []);
+
+  const stopScanner = useCallback(async () => {
+    setEmbeddedScannerVisible(false);
+    await dismissNativeScanner();
+  }, [dismissNativeScanner]);
+
+  const pair = useCallback(
+    async (payload: unknown) => {
+      if (pairingRef.current) {
+        return;
+      }
+      pairingRef.current = true;
+      setPairing(true);
+      setMessage("Pairing link detected. Connecting…");
+      await stopScanner();
+      try {
+        await pairWithQrPayload(payload, {
+          onApprovalCode(code, serverUrl) {
+            setApproval({ code, serverUrl });
+            setApprovalVisible(true);
+            setMessage("Approve this phone from the relay terminal.");
+          },
+        });
+        hapticSuccess();
+        resetChatSessionState();
+        setConnection("checking");
+        router.replace("/");
+      } catch (caught) {
+        pairingRef.current = false;
+        setPairing(false);
+        setApproval(undefined);
+        setApprovalVisible(false);
+        const invalidQr = isPairingQrPayloadError(caught);
+        setMessage(
+          invalidQr
+            ? "This is not a Codex Relay pairing link. Scan or paste the link shown on your computer."
+            : "Could not connect. Check Wi-Fi or Tailscale, then try again.",
+        );
+        hapticWarning();
+        Alert.alert(
+          invalidQr ? "Invalid pairing link" : "Pairing failed",
+          invalidQr
+            ? "Run npx codex-relay@latest on your computer, then scan or paste the pairing link shown there."
+            : "Use the same Wi-Fi on both devices, or turn on Tailscale and try again.",
+        );
+      }
+    },
+    [stopScanner],
+  );
+
+  const openScanner = useCallback(async () => {
+    if (
+      pairingRef.current ||
+      initialPairingUrl ||
+      !isFocused ||
+      AppState.currentState !== "active"
+    ) {
+      return;
+    }
+
+    let permission = cameraPermission;
+    if (!permission?.granted) {
+      permission = await requestCameraPermission();
+    }
+    if (!permission.granted) {
+      setMessage("Camera access is off. Allow it to scan, or paste the pairing link instead.");
+      return;
+    }
+
+    setEmbeddedScannerVisible(false);
+    setMessage("Point the camera at the connection QR.");
+    await dismissNativeScanner();
+
+    if (CameraView.isModernBarcodeScannerAvailable) {
+      nativeScannerOpenRef.current = true;
+      try {
+        await CameraView.launchScanner({
+          barcodeTypes: ["qr"],
+          isHighlightingEnabled: true,
+        });
+        if (!pairingRef.current && AppState.currentState === "active") {
+          return;
+        }
+        await dismissNativeScanner();
+      } catch (caught) {
+        nativeScannerOpenRef.current = false;
+        if (isBarcodeScannerCancellation(caught)) {
+          return;
+        }
+      }
+    }
+
+    if (!pairingRef.current && AppState.currentState === "active") {
+      setEmbeddedScannerVisible(true);
+    }
+  }, [
+    cameraPermission,
+    dismissNativeScanner,
+    initialPairingUrl,
+    isFocused,
+    requestCameraPermission,
+  ]);
+
+  const handlePastedPairingLink = useCallback(
+    (value: string | undefined) => {
+      const pairingLink = value?.trim();
+      if (!pairingLink || !isPairingLink(pairingLink)) {
+        setMessage("Paste the codex-relay:// pairing link shown by the relay terminal.");
+        hapticWarning();
+        Alert.alert(
+          "Invalid pairing link",
+          "Copy the complete codex-relay://pair link printed by codex-relay, then paste it here.",
+        );
+        return;
+      }
+      void pair(pairingLink);
+    },
+    [pair],
+  );
+
+  const pastePairingLink = useCallback(async () => {
+    try {
+      handlePastedPairingLink(await Clipboard.getStringAsync());
+    } catch {
+      Alert.alert("Could not paste", "Copy the pairing link again, then retry.");
+    }
+  }, [handlePastedPairingLink]);
 
   useEffect(() => {
     if (!initialPairingUrl || handledInitialUrlRef.current === initialPairingUrl) {
@@ -81,7 +191,68 @@ export default function PairScreen() {
     void requestCameraPermission();
   }, [cameraPermission, initialPairingUrl, requestCameraPermission]);
 
-  function close() {
+  useFocusEffect(
+    useCallback(() => {
+      setFocused(true);
+      return () => {
+        setFocused(false);
+        resumeNativeScannerRef.current = false;
+        void dismissNativeScanner();
+      };
+    }, [dismissNativeScanner]),
+  );
+
+  useEffect(() => {
+    if (
+      didAutoLaunchScannerRef.current ||
+      !isFocused ||
+      appState !== "active" ||
+      !cameraPermission?.granted ||
+      initialPairingUrl
+    ) {
+      return;
+    }
+    didAutoLaunchScannerRef.current = true;
+    void openScanner();
+  }, [appState, cameraPermission?.granted, initialPairingUrl, isFocused, openScanner]);
+
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      setAppState(nextState);
+      if (nextState !== "active" && nativeScannerOpenRef.current) {
+        resumeNativeScannerRef.current = true;
+        void dismissNativeScanner();
+      }
+    });
+    return () => subscription.remove();
+  }, [dismissNativeScanner]);
+
+  useEffect(() => {
+    if (
+      appState !== "active" ||
+      !isFocused ||
+      !resumeNativeScannerRef.current ||
+      pairingRef.current
+    ) {
+      return;
+    }
+    resumeNativeScannerRef.current = false;
+    void openScanner();
+  }, [appState, isFocused, openScanner]);
+
+  useEffect(() => {
+    const subscription = CameraView.onModernBarcodeScanned((result) => {
+      if (!nativeScannerOpenRef.current || pairingRef.current) {
+        return;
+      }
+      void pair(result.data);
+    });
+    return () => subscription.remove();
+  }, [pair]);
+
+  async function close() {
+    resumeNativeScannerRef.current = false;
+    await stopScanner();
     if (router.canGoBack()) {
       router.back();
       return;
@@ -91,19 +262,26 @@ export default function PairScreen() {
 
   return (
     <View style={styles.screen}>
-      {cameraPermission?.granted && !initialPairingUrl ? (
+      {isEmbeddedScannerVisible && cameraPermission?.granted && !initialPairingUrl ? (
         <CameraView
-          active={!isPairing}
+          active={appState === "active" && isFocused && !isPairing}
           barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
           facing="back"
           onBarcodeScanned={isPairing ? undefined : (result) => void pair(result.data)}
+          onCameraReady={() => setMessage("Point the camera at the connection QR.")}
+          onMountError={() => {
+            setEmbeddedScannerVisible(false);
+            setMessage(
+              "Camera preview is unavailable. Retry the scanner or paste the pairing link.",
+            );
+          }}
           style={styles.camera}
         />
       ) : (
         <View style={styles.permissionPane}>
           {initialPairingUrl || !cameraPermission ? (
             <ActivityIndicator color={Colors.dark.textSecondary} />
-          ) : (
+          ) : !cameraPermission.granted ? (
             <View style={styles.permissionCard}>
               <ThemedText type="smallBold" style={styles.permissionTitle}>
                 Camera access is off
@@ -125,16 +303,29 @@ export default function PairScreen() {
                 </ThemedText>
               </Pressable>
             </View>
+          ) : (
+            <View style={styles.readyCard}>
+              <ThemedText type="smallBold" style={styles.permissionTitle}>
+                Ready to pair
+              </ThemedText>
+              <ThemedText type="small" themeColor="textSecondary" style={styles.centeredCopy}>
+                Open the scanner again, or paste the full pairing link from the relay terminal.
+              </ThemedText>
+            </View>
           )}
         </View>
       )}
 
-      <SafeAreaView edges={["top", "left", "right", "bottom"]} style={styles.overlay}>
+      <SafeAreaView
+        edges={["top", "left", "right", "bottom"]}
+        pointerEvents="box-none"
+        style={styles.overlay}
+      >
         <View style={styles.header}>
           <Pressable
             accessibilityLabel="Close pairing"
             accessibilityRole="button"
-            onPress={close}
+            onPress={() => void close()}
             style={({ pressed }) => [styles.headerButton, pressed && styles.pressed]}
           >
             <Icon name="back" size={18} tintColor={Colors.dark.text} />
@@ -142,21 +333,57 @@ export default function PairScreen() {
           <ThemedText type="smallBold" style={styles.headerTitle}>
             Pair another computer
           </ThemedText>
-          <View style={styles.headerButton} />
+          <View style={styles.headerSpacer} />
         </View>
-        <View style={styles.messageCard}>
-          {isPairing ? <ActivityIndicator color={Colors.dark.text} size="small" /> : null}
-          <ThemedText type="smallBold" style={styles.centeredCopy}>
-            {message}
-          </ThemedText>
-          {approval && !isApprovalVisible ? (
-            <Pressable
-              accessibilityRole="button"
-              onPress={() => setApprovalVisible(true)}
-              style={({ pressed }) => [styles.showApprovalButton, pressed && styles.pressed]}
-            >
-              <ThemedText type="smallBold">Show code</ThemedText>
-            </Pressable>
+        <View style={styles.footer}>
+          <View style={styles.messageCard}>
+            {isPairing ? <ActivityIndicator color={Colors.dark.text} size="small" /> : null}
+            <ThemedText type="smallBold" style={styles.centeredCopy}>
+              {message}
+            </ThemedText>
+            {approval && !isApprovalVisible ? (
+              <Pressable
+                accessibilityRole="button"
+                onPress={() => setApprovalVisible(true)}
+                style={({ pressed }) => [styles.showApprovalButton, pressed && styles.pressed]}
+              >
+                <ThemedText type="smallBold">Show code</ThemedText>
+              </Pressable>
+            ) : null}
+          </View>
+          {!initialPairingUrl && !isPairing ? (
+            <View style={styles.actions}>
+              <Pressable
+                accessibilityLabel="Scan pairing QR"
+                accessibilityRole="button"
+                onPress={() => void openScanner()}
+                style={({ pressed }) => [styles.actionButton, pressed && styles.pressed]}
+              >
+                <ThemedText type="smallBold">Scan QR</ThemedText>
+              </Pressable>
+              {Platform.OS === "ios" && Clipboard.isPasteButtonAvailable ? (
+                <Clipboard.ClipboardPasteButton
+                  acceptedContentTypes={["plain-text", "url"]}
+                  backgroundColor="rgba(255, 255, 255, 0.12)"
+                  cornerStyle="large"
+                  displayMode="iconAndLabel"
+                  foregroundColor={Colors.dark.text}
+                  onPress={(event) =>
+                    handlePastedPairingLink(event.type === "text" ? event.text : undefined)
+                  }
+                  style={styles.nativePasteButton}
+                />
+              ) : (
+                <Pressable
+                  accessibilityLabel="Paste pairing link"
+                  accessibilityRole="button"
+                  onPress={() => void pastePairingLink()}
+                  style={({ pressed }) => [styles.actionButton, pressed && styles.pressed]}
+                >
+                  <ThemedText type="smallBold">Paste link</ThemedText>
+                </Pressable>
+              )}
+            </View>
           ) : null}
         </View>
       </SafeAreaView>
@@ -213,7 +440,37 @@ function firstParam(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+function isPairingLink(value: string) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "codex-relay:" && url.hostname === "pair";
+  } catch {
+    return false;
+  }
+}
+
+function isBarcodeScannerCancellation(error: unknown) {
+  return error instanceof Error && error.message.toLowerCase().includes("cancel");
+}
+
 const styles = StyleSheet.create({
+  actionButton: {
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.12)",
+    borderColor: "rgba(255, 255, 255, 0.14)",
+    borderRadius: 12,
+    borderWidth: 1,
+    height: 44,
+    justifyContent: "center",
+    minWidth: 136,
+    paddingHorizontal: Spacing.three,
+  },
+  actions: {
+    alignItems: "center",
+    flexDirection: "row",
+    gap: Spacing.two,
+    justifyContent: "center",
+  },
   approvalCode: {
     fontFamily: "GeistMono-Medium",
     fontSize: 28,
@@ -228,6 +485,12 @@ const styles = StyleSheet.create({
   },
   centeredCopy: {
     textAlign: "center",
+  },
+  footer: {
+    alignItems: "center",
+    gap: Spacing.two,
+    paddingBottom: Spacing.four,
+    paddingHorizontal: Spacing.three,
   },
   header: {
     alignItems: "center",
@@ -244,6 +507,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     height: 40,
     justifyContent: "center",
+    width: 40,
+  },
+  headerSpacer: {
+    height: 40,
     width: 40,
   },
   headerTitle: {
@@ -264,10 +531,13 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     flexDirection: "row",
     gap: Spacing.two,
-    marginBottom: Spacing.four,
     maxWidth: 360,
     paddingHorizontal: Spacing.three,
     paddingVertical: Spacing.two,
+  },
+  nativePasteButton: {
+    height: 44,
+    width: 136,
   },
   overlay: {
     flex: 1,
@@ -306,6 +576,11 @@ const styles = StyleSheet.create({
   screen: {
     backgroundColor: Colors.dark.background,
     flex: 1,
+  },
+  readyCard: {
+    gap: Spacing.two,
+    maxWidth: 320,
+    padding: Spacing.four,
   },
   showApprovalButton: {
     backgroundColor: "rgba(255, 255, 255, 0.1)",
