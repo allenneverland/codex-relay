@@ -24,6 +24,8 @@ import { isPairingQrPayloadError, pairWithQrPayload } from "@/lib/codex-relay-ap
 import { hapticSuccess, hapticWarning } from "@/lib/haptics";
 import { resetChatSessionState, setConnection } from "@/state/chat-store";
 
+const SCANNER_TO_APPROVAL_SHEET_DELAY_MS = 450;
+
 export default function PairScreen() {
   const params = useLocalSearchParams();
   const initialPairingUrl = useMemo(() => pairingUrlFromParams(params), [params]);
@@ -67,8 +69,12 @@ export default function PairScreen() {
         await pairWithQrPayload(payload, {
           onApprovalCode(code, serverUrl) {
             setApproval({ code, serverUrl });
-            setApprovalVisible(true);
             setMessage("Approve this phone from the relay terminal.");
+            void delay(SCANNER_TO_APPROVAL_SHEET_DELAY_MS).then(() => {
+              if (pairingRef.current) {
+                setApprovalVisible(true);
+              }
+            });
           },
         });
         hapticSuccess();
@@ -451,6 +457,12 @@ function isPairingLink(value: string) {
 
 function isBarcodeScannerCancellation(error: unknown) {
   return error instanceof Error && error.message.toLowerCase().includes("cancel");
+}
+
+function delay(ms: number) {
+  return new Promise<void>((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 const styles = StyleSheet.create({
