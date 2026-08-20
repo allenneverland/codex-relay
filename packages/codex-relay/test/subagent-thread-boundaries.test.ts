@@ -10,7 +10,7 @@ import {
 import { createApp } from "../src/app.js";
 import type { CodexClient } from "../src/codex.js";
 import { createTursoPairingSessionStore } from "../src/pairing-store.js";
-import type { PushNotificationSender, RelayPushNotification } from "../src/push-notifications.js";
+import type { ApnsNotification, PushNotificationSender } from "../src/push-notifications.js";
 
 function unavailableCodex(): CodexClient {
   return {
@@ -166,9 +166,10 @@ describe("subagent thread boundaries", () => {
     });
     await sessions.upsertPushNotificationSubscription({
       actionRequired: true,
+      bundleId: "com.allenneverland.codexrelay",
       clientSessionId: "phone-session",
-      expoPushToken: "ExponentPushToken[phone-token]",
-      platform: "ios",
+      deviceToken: "a".repeat(64),
+      environment: "development",
       turnTerminal: true,
     });
     const notificationHandlers = new Set<(notification: AppServerNotification) => void>();
@@ -185,11 +186,19 @@ describe("subagent thread boundaries", () => {
       requestHandlers.add(handler);
       return () => requestHandlers.delete(handler);
     });
-    const sent: RelayPushNotification[][] = [];
+    vi.spyOn(appServer, "initialize").mockResolvedValue();
+    vi.spyOn(appServer, "listLoadedThreads").mockResolvedValue([]);
+    vi.spyOn(appServer, "listThreadsPage").mockResolvedValue({ data: [], nextCursor: null });
+    vi.spyOn(appServer, "subscribeThread").mockImplementation(async (threadId) =>
+      appServerThread(threadId),
+    );
+    const sent: ApnsNotification[] = [];
     const sender: PushNotificationSender = {
-      async send(notifications) {
-        sent.push([...notifications]);
-        return { invalidExpoPushTokens: [] };
+      configured: true,
+      topic: "com.allenneverland.codexrelay",
+      async send(notification) {
+        sent.push(notification);
+        return { accepted: true, status: 200 };
       },
     };
     createApp({
@@ -204,11 +213,14 @@ describe("subagent thread boundaries", () => {
     });
 
     // When
-    for (const handler of requestHandlers) {
+    for (const handler of notificationHandlers) {
       handler({
-        id: 1,
-        method: "item/tool/requestUserInput",
-        params: { threadId: "subagent-thread", turnId: "subagent-turn" },
+        method: "thread/status/changed",
+        params: {
+          status: { activeFlags: ["waitingOnUserInput"], type: "active" },
+          threadId: "subagent-thread",
+          turnId: "subagent-turn",
+        },
       });
     }
     for (const handler of notificationHandlers) {
@@ -221,11 +233,14 @@ describe("subagent thread boundaries", () => {
         },
       });
     }
-    for (const handler of requestHandlers) {
+    for (const handler of notificationHandlers) {
       handler({
-        id: 2,
-        method: "item/tool/requestUserInput",
-        params: { threadId: "parent-thread", turnId: "parent-turn" },
+        method: "thread/status/changed",
+        params: {
+          status: { activeFlags: ["waitingOnUserInput"], type: "active" },
+          threadId: "parent-thread",
+          turnId: "parent-turn",
+        },
       });
     }
     for (const handler of notificationHandlers) {
@@ -235,31 +250,23 @@ describe("subagent thread boundaries", () => {
       });
     }
     await vi.waitFor(() =>
-      expect(sent.flat().some((notification) => notification.data.intent === "turn_terminal")).toBe(
-        true,
-      ),
+      expect(sent.some((notification) => notification.intent === "turn_terminal")).toBe(true),
     );
 
     // Then
-    expect(sent).toEqual([
-      [
+    expect(sent).toEqual(
+      expect.arrayContaining([
         expect.objectContaining({
-          data: {
-            intent: "action_required",
-            threadId: "parent-thread",
-            turnId: "parent-turn",
-          },
+          intent: "action_required",
+          threadId: "parent-thread",
+          turnId: "parent-turn",
         }),
-      ],
-      [
         expect.objectContaining({
-          data: {
-            intent: "turn_terminal",
-            threadId: "parent-thread",
-            turnId: "parent-turn",
-          },
+          intent: "turn_terminal",
+          threadId: "parent-thread",
+          turnId: "parent-turn",
         }),
-      ],
-    ]);
+      ]),
+    );
   });
 });

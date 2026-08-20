@@ -15,6 +15,7 @@ import {
   ListWorkspaceDirectoriesResponseSchema,
   PairResponseSchema,
   PushNotificationSettingsResponseSchema,
+  PushNotificationTestResponseSchema,
   QueuedThreadInputActionResponseSchema,
   RateLimitsResponseSchema,
   RenameThreadRequestSchema,
@@ -55,6 +56,7 @@ import {
   type ListWorkspaceFilesResponse,
   type ListWorkspaceDirectoriesResponse,
   type PushNotificationSettingsResponse,
+  type PushNotificationTestResponse,
   type QueuedThreadInputActionResponse,
   type RateLimitsResponse,
   type RenameThreadRequest,
@@ -537,6 +539,14 @@ export async function unregisterPushNotifications(): Promise<PushNotificationSet
     apiPaths.pushNotifications,
     { method: "DELETE" },
     PushNotificationSettingsResponseSchema.parse,
+  );
+}
+
+export async function sendTestPushNotification(): Promise<PushNotificationTestResponse> {
+  return request(
+    apiPaths.pushNotificationsTest,
+    { method: "POST" },
+    PushNotificationTestResponseSchema.parse,
   );
 }
 

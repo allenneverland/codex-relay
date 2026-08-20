@@ -1,54 +1,71 @@
 import { useSelector } from "@legendapp/state/react";
+import type { PushNotificationPreferences } from "codex-relay/api-schema";
 import { useEffect, useRef } from "react";
+import { AppState } from "react-native";
 
 import { getPushNotificationSettings, registerPushNotifications } from "@/lib/codex-relay-api";
 import {
+  addApnsPushTokenListener,
   defaultPushNotificationPreferences,
-  getExpoPushToken,
-  hasCompletedInitialPushNotificationRegistration,
-  markInitialPushNotificationRegistrationCompleted,
-  PushNotificationPermissionDeniedError,
-  pushNotificationPlatform,
+  getApnsPushRegistration,
   supportsPushNotifications,
 } from "@/lib/push-notifications";
 import { chatStore$ } from "@/state/chat-store";
 
 export function useInitialPushNotificationRegistration() {
   const hasPairedSession = useSelector(() => chatStore$.hasPairedSession.get());
-  const registrationStartedRef = useRef(false);
+  const preferencesRef = useRef<PushNotificationPreferences>(defaultPushNotificationPreferences);
+  const syncPromiseRef = useRef<Promise<void> | undefined>(undefined);
 
   useEffect(() => {
-    if (
-      !hasPairedSession ||
-      registrationStartedRef.current ||
-      !supportsPushNotifications() ||
-      hasCompletedInitialPushNotificationRegistration()
-    ) {
+    if (!hasPairedSession || !supportsPushNotifications()) {
       return;
     }
 
-    registrationStartedRef.current = true;
-    void registerInitialPushNotifications();
-  }, [hasPairedSession]);
-}
+    const syncRegistration = () => {
+      if (syncPromiseRef.current) {
+        return syncPromiseRef.current;
+      }
+      const sync = (async () => {
+        const settings = await getPushNotificationSettings();
+        const preferences =
+          settings.registered ||
+          settings.preferences.actionRequired ||
+          settings.preferences.turnTerminal
+            ? settings.preferences
+            : defaultPushNotificationPreferences;
+        preferencesRef.current = preferences;
+        await registerPushNotifications({
+          ...(await getApnsPushRegistration()),
+          preferences,
+        });
+      })();
+      syncPromiseRef.current = sync;
+      const clearSync = () => {
+        if (syncPromiseRef.current === sync) {
+          syncPromiseRef.current = undefined;
+        }
+      };
+      void sync.then(clearSync, clearSync);
+      return sync;
+    };
 
-async function registerInitialPushNotifications() {
-  try {
-    const currentSettings = await getPushNotificationSettings();
-    if (currentSettings.registered) {
-      markInitialPushNotificationRegistrationCompleted();
-      return;
-    }
-
-    await registerPushNotifications({
-      expoPushToken: await getExpoPushToken(),
-      platform: pushNotificationPlatform(),
-      preferences: defaultPushNotificationPreferences,
+    void syncRegistration().catch(() => undefined);
+    const appStateSubscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") {
+        void syncRegistration().catch(() => undefined);
+      }
     });
-    markInitialPushNotificationRegistrationCompleted();
-  } catch (error) {
-    if (error instanceof PushNotificationPermissionDeniedError) {
-      markInitialPushNotificationRegistrationCompleted();
-    }
-  }
+    const tokenSubscription = addApnsPushTokenListener((registration) => {
+      void registerPushNotifications({
+        ...registration,
+        preferences: preferencesRef.current,
+      }).catch(() => undefined);
+    });
+
+    return () => {
+      appStateSubscription.remove();
+      tokenSubscription.remove();
+    };
+  }, [hasPairedSession]);
 }

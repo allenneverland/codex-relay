@@ -16,6 +16,7 @@ import {
   PairRequestSchema,
   PairResponseSchema,
   PushNotificationSettingsResponseSchema,
+  PushNotificationTestResponseSchema,
   QueuedThreadInputActionResponseSchema,
   RateLimitsResponseSchema,
   RenameThreadRequestSchema,
@@ -117,6 +118,7 @@ import { homedir, hostname } from "node:os";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { setInterval } from "node:timers";
 import * as pty from "@lydell/node-pty";
 import { z } from "zod";
 
@@ -146,7 +148,7 @@ import { codexRelayDataPath } from "./paths.js";
 import { relayDebugLog } from "./debug-log.js";
 import { permanentClientSessionExpiresAt, type PairingSessionStore } from "./pairing-store.js";
 import {
-  createExpoPushNotificationSender,
+  createApnsPushNotificationSenderFromEnvironment,
   createPushNotificationDispatcher,
   type PushNotificationDispatcher,
   type PushNotificationEvent,
@@ -370,14 +372,25 @@ export function createApp(options: AppOptions = {}) {
     });
     return result;
   }
+  const pushNotificationSender =
+    options.pushNotificationSender ?? createApnsPushNotificationSenderFromEnvironment();
   const pushNotificationDispatcher = options.pairing
     ? createPushNotificationDispatcher({
-        sender: options.pushNotificationSender ?? createExpoPushNotificationSender(),
+        sender: pushNotificationSender,
         sessions: options.pairing.sessions,
       })
     : undefined;
   if (appServer && pushNotificationDispatcher) {
-    observeAppServerPushNotifications(appServer, pushNotificationDispatcher);
+    observeAppServerPushNotifications(
+      appServer,
+      pushNotificationDispatcher,
+      options.pairing!.sessions,
+    );
+    startAppServerPushNotificationReconciliation(
+      appServer,
+      pushNotificationDispatcher,
+      options.pairing!.sessions,
+    );
   }
   const scheduleAppServerHistoryLoad = (threadId: string, cachedMessages: ChatMessage[]) => {
     if (!appServer || appServerHistoryLoadsByThreadId.has(threadId)) {
@@ -749,13 +762,14 @@ export function createApp(options: AppOptions = {}) {
 
     const subscription =
       await options.pairing!.sessions.getPushNotificationSubscription(clientSessionId);
+    const preferences =
+      await options.pairing!.sessions.getPushNotificationPreferences(clientSessionId);
+    const health = await pushNotificationDispatcher!.health(clientSessionId);
     const response = PushNotificationSettingsResponseSchema.parse({
-      preferences: subscription
-        ? {
-            actionRequired: subscription.actionRequired,
-            turnTerminal: subscription.turnTerminal,
-          }
-        : defaultPushNotificationPreferences(),
+      environment: subscription?.environment ?? null,
+      health: pushNotificationHealthResponse(health),
+      preferences,
+      provider: "apns",
       registered: Boolean(subscription),
     });
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
@@ -804,15 +818,33 @@ export function createApp(options: AppOptions = {}) {
       );
     }
 
+    if (parsed.data.bundleId !== pushNotificationSender.topic) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(
+          "push_notification_topic_mismatch",
+          `The app bundle ID must match the configured APNs topic (${pushNotificationSender.topic}).`,
+        ),
+        400,
+      );
+    }
+
     await options.pairing.sessions.upsertPushNotificationSubscription({
       actionRequired: parsed.data.preferences.actionRequired,
+      bundleId: parsed.data.bundleId,
       clientSessionId,
-      expoPushToken: parsed.data.expoPushToken,
-      platform: parsed.data.platform,
+      deviceToken: parsed.data.deviceToken,
+      environment: parsed.data.environment,
       turnTerminal: parsed.data.preferences.turnTerminal,
     });
+    const health = await pushNotificationDispatcher!.health(clientSessionId);
     const response = PushNotificationSettingsResponseSchema.parse({
+      environment: parsed.data.environment,
+      health: pushNotificationHealthResponse(health),
       preferences: parsed.data.preferences,
+      provider: "apns",
       registered: true,
     });
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
@@ -837,11 +869,59 @@ export function createApp(options: AppOptions = {}) {
     }
 
     await options.pairing!.sessions.deletePushNotificationSubscription(clientSessionId);
+    const health = await pushNotificationDispatcher!.health(clientSessionId);
     const response = PushNotificationSettingsResponseSchema.parse({
+      environment: null,
+      health: pushNotificationHealthResponse(health),
       preferences: defaultPushNotificationPreferences(),
+      provider: "apns",
       registered: false,
     });
     return secureJson(c, options.pairing, secureSessionsByTokenHash, response);
+  });
+
+  app.post(apiPaths.pushNotificationsTest, async (c) => {
+    const clientSessionId = await pairedClientSessionIdForAuthorization(
+      c.req.header("authorization"),
+      options.pairing,
+    );
+    if (!clientSessionId || !pushNotificationDispatcher) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError("push_notifications_unavailable", "Pair this device again to test notifications."),
+        401,
+      );
+    }
+    const subscription =
+      await options.pairing!.sessions.getPushNotificationSubscription(clientSessionId);
+    if (!subscription) {
+      return secureJson(
+        c,
+        options.pairing,
+        secureSessionsByTokenHash,
+        apiError(
+          "push_notifications_unregistered",
+          "Register this device for notifications first.",
+        ),
+        400,
+      );
+    }
+
+    const accepted = await pushNotificationDispatcher.sendTest(clientSessionId);
+    const health = await pushNotificationDispatcher.health(clientSessionId);
+    const response = PushNotificationTestResponseSchema.parse({
+      accepted,
+      health: pushNotificationHealthResponse(health),
+    });
+    return secureJson(
+      c,
+      options.pairing,
+      secureSessionsByTokenHash,
+      response,
+      accepted ? 200 : 503,
+    );
   });
 
   app.get(apiPaths.workspaceDirectories, async (c) => {
@@ -3065,6 +3145,19 @@ async function pairedClientSessionIdForAuthorization(
 
 function defaultPushNotificationPreferences() {
   return { actionRequired: false, turnTerminal: false };
+}
+
+function pushNotificationHealthResponse(health: {
+  environment: "development" | "production" | null;
+  lastAcceptedAt: number | null;
+  lastErrorCode: string | null;
+  pendingCount: number;
+  providerConfigured: boolean;
+}) {
+  return {
+    ...health,
+    lastAcceptedAt: health.lastAcceptedAt ? new Date(health.lastAcceptedAt).toISOString() : null,
+  };
 }
 
 function normalizeApprovalCode(value: string) {
@@ -7715,19 +7808,9 @@ function isApprovalServerRequest(method: string) {
 function observeAppServerPushNotifications(
   appServer: CodexAppServerClient,
   dispatcher: PushNotificationDispatcher,
+  sessions: PairingSessionStore,
 ) {
-  const dispatchedEventIds = new Set<string>();
-  const rememberEventId = (eventId: string) => {
-    if (dispatchedEventIds.size >= 1000) {
-      dispatchedEventIds.clear();
-    }
-    dispatchedEventIds.add(eventId);
-  };
-  const dispatch = (event: PushNotificationEvent, eventId: string) => {
-    if (dispatchedEventIds.has(eventId)) {
-      return;
-    }
-    rememberEventId(eventId);
+  const dispatchForRootThread = (event: PushNotificationEvent) => {
     void appServer
       .readThread(event.threadId, { includeTurns: false })
       .then((thread) => {
@@ -7746,21 +7829,41 @@ function observeAppServerPushNotifications(
   };
 
   appServer.onNotification((notification) => {
-    const event = pushNotificationEventFromTerminalNotification(notification);
-    if (!event) {
+    const terminalEvent = pushNotificationEventFromTerminalNotification(notification);
+    if (terminalEvent) {
+      dispatchForRootThread(terminalEvent);
       return;
     }
-    const eventId = `${event.intent}:${event.threadId}:${event.turnId ?? ""}`;
-    dispatch(event, eventId);
-  });
-
-  appServer.onRequest((request) => {
-    const event = pushNotificationEventFromApprovalRequest(request);
-    if (!event) {
+    const waitingState = pushNotificationWaitingState(notification);
+    if (!waitingState) {
       return;
     }
-    const eventId = `${event.intent}:${event.threadId}:${event.turnId ?? ""}:${request.id}`;
-    dispatch(event, eventId);
+    void appServer
+      .readThread(waitingState.threadId, { includeTurns: false })
+      .then(async (thread) => {
+        if (isSubagentThread(thread)) {
+          return;
+        }
+        const generation = await sessions.recordThreadWaitingState(
+          waitingState.threadId,
+          waitingState.waiting,
+          Date.now(),
+        );
+        if (generation) {
+          await dispatcher.dispatch({
+            eventId: `action_required:${waitingState.threadId}:${generation}`,
+            intent: "action_required",
+            threadId: waitingState.threadId,
+            ...(waitingState.turnId ? { turnId: waitingState.turnId } : {}),
+          });
+        }
+      })
+      .catch((error) => {
+        relayDebugLog("push_notification.waiting_state_failed", {
+          error: errorMessage(error),
+          threadId: waitingState.threadId,
+        });
+      });
   });
 }
 
@@ -7778,30 +7881,185 @@ function pushNotificationEventFromTerminalNotification(notification: AppServerNo
   ) {
     return undefined;
   }
+  if (status && status !== "completed" && status !== "failed") {
+    return undefined;
+  }
   const threadId = firstString(params, ["threadId", "conversationId"]);
   if (!threadId) {
     return undefined;
   }
   return {
+    eventId: `turn_terminal:${threadId}:${firstString(params, ["turnId"]) ?? turnIdFromParams(params) ?? "unknown"}`,
     intent: "turn_terminal" as const,
     threadId,
     turnId: firstString(params, ["turnId"]) ?? turnIdFromParams(params),
   };
 }
 
-function pushNotificationEventFromApprovalRequest(request: AppServerRequest) {
-  if (!isApprovalServerRequest(request.method)) {
+function pushNotificationWaitingState(notification: AppServerNotification) {
+  if (notification.method !== "thread/status/changed") {
     return undefined;
   }
-  const approval = approvalMessageFromRequest(request);
-  if (!approval) {
+  const params = recordParams(notification);
+  const threadId = firstString(params, ["threadId", "conversationId"]);
+  if (!threadId) {
     return undefined;
   }
+  const status = params?.status;
+  const activeFlags =
+    status && typeof status === "object"
+      ? (status as { activeFlags?: unknown }).activeFlags
+      : undefined;
+  const flags = Array.isArray(activeFlags) ? activeFlags : [];
   return {
-    intent: "action_required" as const,
-    threadId: approval.threadId,
-    turnId: approval.turnId,
+    threadId,
+    turnId: firstString(params, ["turnId"]),
+    waiting: flags.includes("waitingOnApproval") || flags.includes("waitingOnUserInput"),
   };
+}
+
+function startAppServerPushNotificationReconciliation(
+  appServer: CodexAppServerClient,
+  dispatcher: PushNotificationDispatcher,
+  sessions: PairingSessionStore,
+) {
+  if (
+    typeof appServer.listLoadedThreads !== "function" ||
+    typeof appServer.subscribeThread !== "function"
+  ) {
+    return;
+  }
+  const subscribedThreadIds = new Set<string>();
+  let connectionGeneration = -1;
+  let running = false;
+
+  const run = async (reconcile: boolean) => {
+    if (running) {
+      return;
+    }
+    running = true;
+    try {
+      await appServer.initialize();
+      const nextConnectionGeneration = appServer.appServerConnectionGeneration;
+      const reconnected = nextConnectionGeneration !== connectionGeneration;
+      if (reconnected) {
+        connectionGeneration = nextConnectionGeneration;
+        subscribedThreadIds.clear();
+      }
+
+      const loadedThreads = await appServer.listLoadedThreads();
+      for (const thread of loadedThreads) {
+        if (isSubagentThread(thread) || subscribedThreadIds.has(thread.id)) {
+          continue;
+        }
+        await appServer.subscribeThread(thread.id);
+        subscribedThreadIds.add(thread.id);
+      }
+
+      if (reconcile || reconnected) {
+        await reconcileAppServerPushNotifications(appServer, dispatcher, sessions);
+      }
+    } catch (error) {
+      relayDebugLog("push_notification.reconciliation_failed", {
+        error: errorMessage(error),
+      });
+    } finally {
+      running = false;
+    }
+  };
+
+  void run(true);
+  const subscriptionTimer = setInterval(() => void run(false), 10_000);
+  const reconciliationTimer = setInterval(() => void run(true), 60_000);
+  (subscriptionTimer as unknown as { unref(): void }).unref();
+  (reconciliationTimer as unknown as { unref(): void }).unref();
+}
+
+async function reconcileAppServerPushNotifications(
+  appServer: CodexAppServerClient,
+  dispatcher: PushNotificationDispatcher,
+  sessions: PairingSessionStore,
+) {
+  const checkpointKey = "app_server_reconciliation_checkpoint";
+  const checkpoint = Number(await sessions.getPushNotificationMetadata(checkpointKey));
+  const baseline = !Number.isFinite(checkpoint) || checkpoint <= 0;
+  const startedAt = Math.floor(Date.now() / 1000);
+  const overlapStart = baseline ? startedAt : checkpoint - 5 * 60;
+  const threads: AppServerThread[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = await appServer.listThreadsPage(100, cursor);
+    threads.push(...page.data);
+    const oldestUpdatedAt = page.data.at(-1)?.updatedAt;
+    if (
+      baseline ||
+      !page.nextCursor ||
+      (oldestUpdatedAt !== undefined && oldestUpdatedAt < overlapStart)
+    ) {
+      break;
+    }
+    cursor = page.nextCursor;
+  } while (cursor);
+
+  for (const threadSummary of threads) {
+    if (isSubagentThread(threadSummary) || (!baseline && threadSummary.updatedAt < overlapStart)) {
+      continue;
+    }
+    const thread = baseline
+      ? threadSummary
+      : await appServer.readThread(threadSummary.id, { includeTurns: true });
+    if (isSubagentThread(thread)) {
+      continue;
+    }
+    const waiting = appServerThreadWaitingOnUser(thread);
+    const generation = await sessions.recordThreadWaitingState(thread.id, waiting, Date.now());
+    if (!baseline && generation) {
+      await dispatcher.dispatch({
+        eventId: `action_required:${thread.id}:${generation}`,
+        intent: "action_required",
+        threadId: thread.id,
+        turnId: latestActiveTurnId(thread),
+      });
+    }
+    if (baseline) {
+      continue;
+    }
+    for (const turn of thread.turns ?? []) {
+      const completedAt = turn.completedAt ?? 0;
+      const status = typeof turn.status === "string" ? turn.status : undefined;
+      if (
+        completedAt < overlapStart ||
+        completedAt > startedAt ||
+        (status !== "completed" && status !== "failed")
+      ) {
+        continue;
+      }
+      await dispatcher.dispatch({
+        eventId: `turn_terminal:${thread.id}:${turn.id}`,
+        intent: "turn_terminal",
+        threadId: thread.id,
+        turnId: turn.id,
+      });
+    }
+  }
+
+  await sessions.setPushNotificationMetadata(checkpointKey, String(startedAt), Date.now());
+}
+
+function appServerThreadWaitingOnUser(thread: AppServerThread) {
+  const status = thread.status;
+  if (!status || typeof status !== "object") {
+    return false;
+  }
+  const activeFlags = (status as { activeFlags?: unknown }).activeFlags;
+  return (
+    Array.isArray(activeFlags) &&
+    (activeFlags.includes("waitingOnApproval") || activeFlags.includes("waitingOnUserInput"))
+  );
+}
+
+function latestActiveTurnId(thread: AppServerThread) {
+  return [...(thread.turns ?? [])].reverse().find((turn) => turn.completedAt === null)?.id;
 }
 
 function approvalMessageFromRequest(request: AppServerRequest) {

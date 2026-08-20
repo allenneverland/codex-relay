@@ -56,7 +56,7 @@ const program = new Command()
 Examples:
   ${npxCommand}              Start the relay and print a pairing QR
   ${npxCommand} --shared-app-server Share live sessions with a connected terminal
-  ${npxCommand} --bg         Start the relay in the background
+  ${npxCommand} --shared-app-server --bg Start shared relay in the background
   ${npxCommand} stop         Stop the background relay
   ${npxCommand} qr           Print the current pairing QR
   ${npxCommand} clear        Sign out every paired mobile app
@@ -74,6 +74,7 @@ Examples:
     }
 
     if (options.bg) {
+      process.env.CODEX_RELAY_APP_SERVER_MODE = "socket";
       await startBackgroundServer();
       return;
     }
@@ -385,7 +386,7 @@ async function printPairingQr() {
   if (!state?.pairingPayload) {
     console.error("No running Codex Relay server state was found.");
     console.error(`Start the server first with: ${npxCommand}`);
-    console.error(`Or run it in the background with: ${npxCommand} --bg`);
+    console.error(`Or run it in the background with: ${npxCommand} --shared-app-server --bg`);
     process.exitCode = 1;
     return;
   }
@@ -454,7 +455,7 @@ async function handleServerStartError(error: unknown) {
   }
   console.error("");
   console.error("If you wanted a persistent server, start it once with:");
-  console.error(`  ${npxCommand} --bg`);
+  console.error(`  ${npxCommand} --shared-app-server --bg`);
   process.exitCode = 1;
 }
 

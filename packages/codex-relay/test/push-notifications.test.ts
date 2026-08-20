@@ -1,137 +1,202 @@
+import { generateKeyPairSync } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
 
 import { createTursoPairingSessionStore } from "../src/pairing-store.js";
 import {
-  createExpoPushNotificationSender,
+  classifyApnsFailure,
+  createApnsPushNotificationSender,
   createPushNotificationDispatcher,
+  type ApnsNotification,
+  type ApnsTransport,
   type PushNotificationSender,
-  type RelayPushNotification,
 } from "../src/push-notifications.js";
 
-describe("Expo push notification sender", () => {
-  it("sends generic relay payloads and identifies invalid device tokens", async () => {
-    const requests: Array<{ init?: RequestInit; input: RequestInfo | URL }> = [];
-    const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push({ init, input });
-      return new Response(
-        JSON.stringify({
-          data: [
-            { id: "ticket-ok", status: "ok" },
-            {
-              details: { error: "DeviceNotRegistered" },
-              message: "The device is not registered for push notifications.",
-              status: "error",
-            },
-          ],
-        }),
-        { status: 200 },
-      );
+describe("APNs push notification sender", () => {
+  it("routes sandbox and production requests with APNs alert headers and generic payloads", async () => {
+    const requests: Array<{
+      body: string;
+      endpoint: string;
+      headers: Record<string, string | number>;
+    }> = [];
+    const transport: ApnsTransport = {
+      async request(endpoint, headers, body) {
+        requests.push({ body, endpoint, headers });
+        return { body: "", headers: { "apns-id": "apns-1" }, status: 200 };
+      },
     };
-    const sender = createExpoPushNotificationSender(fetchImpl as typeof fetch);
+    const privateKey = generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey;
+    const sender = createApnsPushNotificationSender({
+      keyId: "KEY123",
+      privateKey,
+      teamId: "TEAM123",
+      topic: "com.allenneverland.codexrelay",
+      transport,
+      now: () => 1_800_000_000_000,
+    });
+    const notification: ApnsNotification = {
+      bundleId: "com.allenneverland.codexrelay",
+      collapseId: "event-1",
+      deviceToken: "a".repeat(64),
+      environment: "development",
+      eventId: "turn_terminal:thread-1:turn-1",
+      expiresAt: 1_800_086_400_000,
+      intent: "turn_terminal",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    };
 
-    const delivery = await sender.send([
-      {
-        body: "A Codex turn has finished.",
-        data: { intent: "turn_terminal", threadId: "thread-1", turnId: "turn-1" },
-        title: "Codex Relay",
-        to: "ExponentPushToken[active]",
-      },
-      {
-        body: "Codex needs your attention.",
-        data: { intent: "action_required", threadId: "thread-2" },
-        title: "Codex Relay",
-        to: "ExponentPushToken[stale]",
-      },
-    ]);
+    await expect(sender.send(notification)).resolves.toEqual({
+      accepted: true,
+      apnsId: "apns-1",
+      status: 200,
+    });
+    await sender.send({ ...notification, environment: "production" });
 
-    expect(delivery.invalidExpoPushTokens).toEqual(["ExponentPushToken[stale]"]);
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.input).toBe("https://exp.host/--/api/v2/push/send");
-    expect(requests[0]?.init).toMatchObject({ method: "POST" });
-    const payload = JSON.parse(String(requests[0]?.init?.body));
-    expect(payload).toEqual([
-      expect.objectContaining({
-        body: "A Codex turn has finished.",
-        data: { intent: "turn_terminal", threadId: "thread-1", turnId: "turn-1" },
-        title: "Codex Relay",
-      }),
-      expect.objectContaining({
-        body: "Codex needs your attention.",
-        data: { intent: "action_required", threadId: "thread-2" },
-        title: "Codex Relay",
-      }),
+    expect(requests.map((request) => request.endpoint)).toEqual([
+      "https://api.sandbox.push.apple.com",
+      "https://api.push.apple.com",
     ]);
+    expect(requests[0]?.headers).toMatchObject({
+      ":method": "POST",
+      ":path": `/3/device/${"a".repeat(64)}`,
+      "apns-collapse-id": "event-1",
+      "apns-priority": 10,
+      "apns-push-type": "alert",
+      "apns-topic": "com.allenneverland.codexrelay",
+    });
+    expect(requests[0]?.headers.authorization).toMatch(/^bearer [^.]+\.[^.]+\.[^.]+$/);
+    expect(JSON.parse(requests[0]!.body)).toEqual({
+      aps: {
+        alert: { body: "A Codex turn has finished.", title: "Codex Relay" },
+        sound: "default",
+      },
+      eventId: "turn_terminal:thread-1:turn-1",
+      intent: "turn_terminal",
+      threadId: "thread-1",
+      turnId: "turn-1",
+    });
+  });
+
+  it("classifies APNs invalid-token, transient, and permanent responses", () => {
+    expect(
+      classifyApnsFailure({
+        accepted: false,
+        reason: "Unregistered",
+        status: 410,
+      }),
+    ).toBe("invalid_device_token");
+    expect(
+      classifyApnsFailure({
+        accepted: false,
+        reason: "TooManyRequests",
+        status: 429,
+      }),
+    ).toBe("transient");
+    expect(
+      classifyApnsFailure({
+        accepted: false,
+        reason: "BadTopic",
+        status: 400,
+      }),
+    ).toBe("permanent");
   });
 });
 
-describe("push notification dispatcher", () => {
-  it("routes only opted-in intents and removes device-not-registered subscriptions", async () => {
-    const sessions = await createTursoPairingSessionStore(":memory:");
-    const expiresAt = Date.now() + 60_000;
-    await sessions.createSession("turn-token", {
-      clientSessionId: "turn-device",
-      expiresAt,
-    });
-    await sessions.createSession("action-token", {
-      clientSessionId: "action-device",
-      expiresAt,
-    });
-    await sessions.upsertPushNotificationSubscription({
-      actionRequired: false,
-      clientSessionId: "turn-device",
-      expoPushToken: "ExponentPushToken[turn-device]",
-      platform: "ios",
-      turnTerminal: true,
-    });
-    await sessions.upsertPushNotificationSubscription({
-      actionRequired: true,
-      clientSessionId: "action-device",
-      expoPushToken: "ExponentPushToken[action-device]",
-      platform: "android",
-      turnTerminal: false,
+describe("durable APNs outbox", () => {
+  it("retries a transient failure after a dispatcher restart and deduplicates the event", async () => {
+    const sessions = await registeredSessions();
+    let currentTime = 1_800_000_000_000;
+    let attempts = 0;
+    const sender: PushNotificationSender = {
+      configured: true,
+      topic: "com.allenneverland.codexrelay",
+      async send() {
+        attempts += 1;
+        return attempts === 1
+          ? { accepted: false, reason: "InternalServerError", status: 500 }
+          : { accepted: true, apnsId: "apns-retry", status: 200 };
+      },
+    };
+    const event = {
+      eventId: "turn_terminal:thread-1:turn-1",
+      intent: "turn_terminal" as const,
+      threadId: "thread-1",
+      turnId: "turn-1",
+    };
+    const first = createPushNotificationDispatcher({
+      now: () => currentTime,
+      sender,
+      sessions,
     });
 
-    const sent: RelayPushNotification[][] = [];
+    await first.dispatch(event);
+    expect(await first.health("phone-session")).toMatchObject({
+      lastErrorCode: "InternalServerError",
+      pendingCount: 1,
+    });
+
+    currentTime += 5_000;
+    const restarted = createPushNotificationDispatcher({
+      now: () => currentTime,
+      sender,
+      sessions,
+    });
+    await waitUntil(() => attempts === 2);
+    expect(await restarted.health("phone-session")).toMatchObject({
+      lastAcceptedAt: currentTime,
+      pendingCount: 0,
+    });
+
+    await restarted.dispatch(event);
+    expect(attempts).toBe(2);
+  });
+
+  it("disables a subscription when APNs rejects its device token", async () => {
+    const sessions = await registeredSessions();
     const sender: PushNotificationSender = {
-      async send(notifications) {
-        sent.push([...notifications]);
-        return {
-          invalidExpoPushTokens: notifications
-            .filter((notification) => notification.to === "ExponentPushToken[turn-device]")
-            .map((notification) => notification.to),
-        };
+      configured: true,
+      topic: "com.allenneverland.codexrelay",
+      async send() {
+        return { accepted: false, reason: "BadDeviceToken", status: 400 };
       },
     };
     const dispatcher = createPushNotificationDispatcher({ sender, sessions });
 
     await dispatcher.dispatch({
+      eventId: "turn_terminal:thread-1:turn-1",
       intent: "turn_terminal",
       threadId: "thread-1",
       turnId: "turn-1",
     });
-    await dispatcher.dispatch({
-      intent: "action_required",
-      threadId: "thread-2",
-      turnId: "turn-2",
-    });
 
-    expect(sent).toEqual([
-      [
-        expect.objectContaining({
-          data: { intent: "turn_terminal", threadId: "thread-1", turnId: "turn-1" },
-          to: "ExponentPushToken[turn-device]",
-        }),
-      ],
-      [
-        expect.objectContaining({
-          data: { intent: "action_required", threadId: "thread-2", turnId: "turn-2" },
-          to: "ExponentPushToken[action-device]",
-        }),
-      ],
-    ]);
-    expect(await sessions.getPushNotificationSubscription("turn-device")).toBeUndefined();
-    expect(await sessions.getPushNotificationSubscription("action-device")).toEqual(
-      expect.objectContaining({ expoPushToken: "ExponentPushToken[action-device]" }),
-    );
+    expect(await sessions.getPushNotificationSubscription("phone-session")).toBeUndefined();
   });
 });
+
+async function registeredSessions() {
+  const sessions = await createTursoPairingSessionStore(":memory:");
+  await sessions.createSession("client-token", {
+    clientSessionId: "phone-session",
+    expiresAt: Date.now() + 60_000,
+  });
+  await sessions.upsertPushNotificationSubscription({
+    actionRequired: true,
+    bundleId: "com.allenneverland.codexrelay",
+    clientSessionId: "phone-session",
+    deviceToken: "a".repeat(64),
+    environment: "development",
+    turnTerminal: true,
+  });
+  return sessions;
+}
+
+async function waitUntil(condition: () => boolean) {
+  const timeoutAt = Date.now() + 1_000;
+  while (!condition()) {
+    if (Date.now() >= timeoutAt) {
+      throw new Error("Timed out waiting for notification delivery.");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}

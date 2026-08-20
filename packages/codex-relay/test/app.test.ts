@@ -18,7 +18,7 @@ import {
   createFileRuntimePreferencesStore,
   type RuntimePreferencesStore,
 } from "../src/preferences-store.js";
-import type { PushNotificationSender, RelayPushNotification } from "../src/push-notifications.js";
+import type { ApnsNotification, PushNotificationSender } from "../src/push-notifications.js";
 import { createServerIdentity } from "../src/secure-transport.js";
 
 const execFileAsync = promisify(execFile);
@@ -1202,6 +1202,13 @@ describe("Codex Relay server routes", () => {
       clientSessionId: "phone-session",
       expiresAt: Date.now() + 60_000,
     });
+    const sender: PushNotificationSender = {
+      configured: true,
+      topic: "com.allenneverland.codexrelay",
+      async send() {
+        return { accepted: true, apnsId: "apns-test", status: 200 };
+      },
+    };
     const app = createApp({
       codex: createMockCodex(),
       pairing: {
@@ -1209,13 +1216,32 @@ describe("Codex Relay server routes", () => {
         hashClientToken: (token) => token,
         sessions,
       },
+      pushNotificationSender: sender,
     });
+
+    const mismatch = await app.request("/v1/notifications/push", {
+      method: "PUT",
+      body: JSON.stringify({
+        bundleId: "com.example.wrong",
+        deviceToken: "a".repeat(64),
+        environment: "development",
+        provider: "apns",
+        preferences: { actionRequired: true, turnTerminal: false },
+      }),
+      headers: {
+        authorization: "Bearer client-token",
+        "content-type": "application/json",
+      },
+    });
+    expect(mismatch.status).toBe(400);
 
     const registration = await app.request("/v1/notifications/push", {
       method: "PUT",
       body: JSON.stringify({
-        expoPushToken: "ExponentPushToken[phone-token]",
-        platform: "ios",
+        bundleId: "com.allenneverland.codexrelay",
+        deviceToken: "a".repeat(64),
+        environment: "development",
+        provider: "apns",
         preferences: { actionRequired: true, turnTerminal: false },
       }),
       headers: {
@@ -1226,14 +1252,24 @@ describe("Codex Relay server routes", () => {
 
     expect(registration.status).toBe(200);
     await expect(registration.json()).resolves.toEqual({
+      environment: "development",
+      health: {
+        environment: "development",
+        lastAcceptedAt: null,
+        lastErrorCode: null,
+        pendingCount: 0,
+        providerConfigured: true,
+      },
       preferences: { actionRequired: true, turnTerminal: false },
+      provider: "apns",
       registered: true,
     });
     expect(await sessions.getPushNotificationSubscription("phone-session")).toEqual({
       actionRequired: true,
+      bundleId: "com.allenneverland.codexrelay",
       clientSessionId: "phone-session",
-      expoPushToken: "ExponentPushToken[phone-token]",
-      platform: "ios",
+      deviceToken: "a".repeat(64),
+      environment: "development",
       turnTerminal: false,
     });
 
@@ -1241,8 +1277,32 @@ describe("Codex Relay server routes", () => {
       headers: { authorization: "Bearer client-token" },
     });
     await expect(settings.json()).resolves.toEqual({
+      environment: "development",
+      health: {
+        environment: "development",
+        lastAcceptedAt: null,
+        lastErrorCode: null,
+        pendingCount: 0,
+        providerConfigured: true,
+      },
       preferences: { actionRequired: true, turnTerminal: false },
+      provider: "apns",
       registered: true,
+    });
+
+    const testNotification = await app.request("/v1/notifications/push/test", {
+      method: "POST",
+      headers: { authorization: "Bearer client-token" },
+    });
+    expect(testNotification.status).toBe(200);
+    await expect(testNotification.json()).resolves.toMatchObject({
+      accepted: true,
+      health: {
+        environment: "development",
+        lastAcceptedAt: expect.any(String),
+        pendingCount: 0,
+        providerConfigured: true,
+      },
     });
 
     const removal = await app.request("/v1/notifications/push", {
@@ -1251,7 +1311,16 @@ describe("Codex Relay server routes", () => {
     });
     expect(removal.status).toBe(200);
     await expect(removal.json()).resolves.toEqual({
+      environment: null,
+      health: {
+        environment: null,
+        lastAcceptedAt: expect.any(String),
+        lastErrorCode: null,
+        pendingCount: 0,
+        providerConfigured: true,
+      },
       preferences: { actionRequired: false, turnTerminal: false },
+      provider: "apns",
       registered: false,
     });
     expect(await sessions.getPushNotificationSubscription("phone-session")).toBeUndefined();
@@ -1265,9 +1334,10 @@ describe("Codex Relay server routes", () => {
     });
     await sessions.upsertPushNotificationSubscription({
       actionRequired: true,
+      bundleId: "com.allenneverland.codexrelay",
       clientSessionId: "phone-session",
-      expoPushToken: "ExponentPushToken[phone-token]",
-      platform: "ios",
+      deviceToken: "a".repeat(64),
+      environment: "development",
       turnTerminal: true,
     });
     const notificationHandlers = new Set<(notification: unknown) => void>();
@@ -1287,11 +1357,13 @@ describe("Codex Relay server routes", () => {
         return () => requestHandlers.delete(handler);
       },
     };
-    const sent: RelayPushNotification[][] = [];
+    const sent: ApnsNotification[] = [];
     const sender: PushNotificationSender = {
-      async send(notifications) {
-        sent.push([...notifications]);
-        return { invalidExpoPushTokens: [] };
+      configured: true,
+      topic: "com.allenneverland.codexrelay",
+      async send(notification) {
+        sent.push(notification);
+        return { accepted: true, status: 200 };
       },
     };
     createApp({
@@ -1345,13 +1417,18 @@ describe("Codex Relay server routes", () => {
         method: "turn/completed",
         params: { status: "cancelled", threadId: "thread-cancelled", turnId: "turn-2" },
       });
-    }
-    for (const handler of requestHandlers) {
       handler({
-        id: 7,
-        method: "item/tool/requestUserInput",
+        method: "thread/status/changed",
         params: {
-          questions: [{ id: "scope", question: "What should Codex do next?" }],
+          status: { activeFlags: ["waitingOnUserInput"], type: "active" },
+          threadId: "thread-1",
+          turnId: "turn-1",
+        },
+      });
+      handler({
+        method: "thread/status/changed",
+        params: {
+          status: { activeFlags: ["waitingOnUserInput"], type: "active" },
           threadId: "thread-1",
           turnId: "turn-1",
         },
@@ -1360,16 +1437,16 @@ describe("Codex Relay server routes", () => {
 
     await waitUntil(() => expect(sent).toHaveLength(2));
     expect(sent).toEqual([
-      [
-        expect.objectContaining({
-          data: { intent: "turn_terminal", threadId: "thread-1", turnId: "turn-1" },
-        }),
-      ],
-      [
-        expect.objectContaining({
-          data: { intent: "action_required", threadId: "thread-1", turnId: "turn-1" },
-        }),
-      ],
+      expect.objectContaining({
+        intent: "turn_terminal",
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
+      expect.objectContaining({
+        intent: "action_required",
+        threadId: "thread-1",
+        turnId: "turn-1",
+      }),
     ]);
   });
 

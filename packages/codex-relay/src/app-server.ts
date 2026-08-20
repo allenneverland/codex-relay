@@ -272,6 +272,7 @@ export class CodexAppServerClient {
   private activeMode: CodexAppServerMode;
   private child: ChildProcessWithoutNullStreams | undefined;
   private closed = false;
+  private connectionGeneration = 0;
   private fallbackToStdio: boolean;
   private initialized: Promise<void> | undefined;
   private notificationHandlers = new Set<(notification: AppServerNotification) => void>();
@@ -298,18 +299,31 @@ export class CodexAppServerClient {
     return this.activeMode;
   }
 
+  get appServerConnectionGeneration() {
+    return this.connectionGeneration;
+  }
+
   initialize() {
     return this.ensureInitialized();
   }
 
   async listThreads(limit = 80) {
-    const response = await this.request<{ data: AppServerThread[] }>("thread/list", {
+    return (await this.listThreadsPage(limit)).data;
+  }
+
+  async listThreadsPage(limit = 100, cursor?: string) {
+    return this.request<{ data: AppServerThread[]; nextCursor?: string | null }>("thread/list", {
+      ...(cursor ? { cursor } : {}),
       limit,
       sortKey: "updated_at",
       sortDirection: "desc",
       sourceKinds: [],
       archived: false,
     });
+  }
+
+  async listLoadedThreads() {
+    const response = await this.request<{ data: AppServerThread[] }>("thread/loaded/list", null);
     return response.data;
   }
 
@@ -340,6 +354,13 @@ export class CodexAppServerClient {
 
   async resumeThread(params: AppServerThreadResumeParams) {
     const response = await this.request<{ thread: AppServerThread }>("thread/resume", params);
+    return response.thread;
+  }
+
+  async subscribeThread(threadId: string) {
+    const response = await this.request<{ thread: AppServerThread }>("thread/resume", {
+      threadId,
+    });
     return response.thread;
   }
 
@@ -491,6 +512,7 @@ export class CodexAppServerClient {
         experimentalApi: true,
       },
     });
+    this.connectionGeneration += 1;
   }
 
   private startStdioCodexAppServer() {

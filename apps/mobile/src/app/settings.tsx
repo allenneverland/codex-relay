@@ -25,9 +25,9 @@ import {
   getPushNotificationSettings,
   registerPushNotifications,
   refreshSession,
+  sendTestPushNotification,
   setCodexRelayServerUrl,
   signOutCodexRelaySession,
-  unregisterPushNotifications,
   type CodexRelayServerUrlCandidate,
 } from "@/lib/codex-relay-api";
 import { hapticSelection, hapticWarning } from "@/lib/haptics";
@@ -39,9 +39,7 @@ import {
 import { formatMobileReleaseVersion } from "@/lib/mobile-release-version";
 import {
   defaultPushNotificationPreferences,
-  getExpoPushToken,
-  markInitialPushNotificationRegistrationCompleted,
-  pushNotificationPlatform,
+  getApnsPushRegistration,
   supportsPushNotifications,
 } from "@/lib/push-notifications";
 import { formatRateLimitRemaining, visibleRateLimitRows } from "@/lib/rate-limits";
@@ -106,6 +104,9 @@ export default function SettingsScreen() {
   );
   const [pushNotificationsLoading, setPushNotificationsLoading] = useState(false);
   const [pushNotificationsUpdating, setPushNotificationsUpdating] = useState(false);
+  const [pushNotificationHealth, setPushNotificationHealth] = useState<
+    Awaited<ReturnType<typeof getPushNotificationSettings>>["health"] | undefined
+  >();
   const pushNotificationsSupported = supportsPushNotifications();
   const rateLimitRows = visibleRateLimitRows(rateLimitsQuery.data?.buckets ?? []);
   const isAppUpdatePending =
@@ -179,6 +180,7 @@ export default function SettingsScreen() {
     let isActive = true;
     if (!hasPairedSession || !pushNotificationsSupported) {
       setPushNotificationPreferences(defaultPushNotificationPreferences);
+      setPushNotificationHealth(undefined);
       setPushNotificationsLoading(false);
       return () => {
         isActive = false;
@@ -190,11 +192,13 @@ export default function SettingsScreen() {
       .then((settings) => {
         if (isActive) {
           setPushNotificationPreferences(settings.preferences);
+          setPushNotificationHealth(settings.health);
         }
       })
       .catch(() => {
         if (isActive) {
           setPushNotificationPreferences(defaultPushNotificationPreferences);
+          setPushNotificationHealth(undefined);
         }
       })
       .finally(() => {
@@ -236,24 +240,46 @@ export default function SettingsScreen() {
     const previousPreferences = pushNotificationPreferences;
     const nextPreferences = { ...previousPreferences, [preference]: value };
     hapticSelection();
-    markInitialPushNotificationRegistrationCompleted();
     setPushNotificationPreferences(nextPreferences);
     setPushNotificationsUpdating(true);
 
     try {
-      const settings =
-        nextPreferences.actionRequired || nextPreferences.turnTerminal
-          ? await registerPushNotifications({
-              expoPushToken: await getExpoPushToken(),
-              platform: pushNotificationPlatform(),
-              preferences: nextPreferences,
-            })
-          : await unregisterPushNotifications();
+      const settings = await registerPushNotifications({
+        ...(await getApnsPushRegistration()),
+        preferences: nextPreferences,
+      });
       setPushNotificationPreferences(settings.preferences);
+      setPushNotificationHealth(settings.health);
     } catch (caught) {
       setPushNotificationPreferences(previousPreferences);
       hapticWarning();
       Alert.alert("Notifications unavailable", settingsErrorMessage(caught));
+    } finally {
+      setPushNotificationsUpdating(false);
+    }
+  }
+
+  async function sendNotificationTest() {
+    if (pushNotificationsUpdating) {
+      return;
+    }
+    hapticSelection();
+    setPushNotificationsUpdating(true);
+    try {
+      const result = await sendTestPushNotification();
+      setPushNotificationHealth(result.health);
+      Alert.alert(
+        result.accepted ? "Test notification sent" : "Test notification pending",
+        result.accepted
+          ? "Apple accepted the notification."
+          : "The relay will retry according to the delivery status below.",
+      );
+    } catch (caught) {
+      hapticWarning();
+      Alert.alert("Test notification failed", settingsErrorMessage(caught));
+      void getPushNotificationSettings().then((settings) => {
+        setPushNotificationHealth(settings.health);
+      });
     } finally {
       setPushNotificationsUpdating(false);
     }
@@ -568,11 +594,52 @@ export default function SettingsScreen() {
                       onValueChange={(value) =>
                         void updatePushNotificationPreference("actionRequired", value)
                       }
-                      showDivider={false}
                       subtitle="When Codex needs approval or input"
                       title="Action required"
                       value={pushNotificationPreferences.actionRequired}
                     />
+                    <View style={styles.notificationHealth}>
+                      <ThemedText type="smallBold" style={styles.notificationTitle}>
+                        Delivery health
+                      </ThemedText>
+                      <ThemedText
+                        type="small"
+                        themeColor="textSecondary"
+                        style={styles.notificationSubtitle}
+                      >
+                        {pushNotificationHealth
+                          ? [
+                              `Provider: ${pushNotificationHealth.providerConfigured ? "configured" : "not configured"}`,
+                              `Environment: ${pushNotificationHealth.environment ?? "unregistered"}`,
+                              `Pending: ${pushNotificationHealth.pendingCount}`,
+                              `Last accepted: ${formatNotificationTime(pushNotificationHealth.lastAcceptedAt)}`,
+                              `Last error: ${pushNotificationHealth.lastErrorCode ?? "none"}`,
+                            ].join("\n")
+                          : "Loading delivery status…"}
+                      </ThemedText>
+                      <Pressable
+                        accessibilityRole="button"
+                        accessibilityLabel="Send test notification"
+                        accessibilityState={{
+                          disabled:
+                            pushNotificationsUpdating ||
+                            !pushNotificationHealth?.providerConfigured,
+                        }}
+                        disabled={
+                          pushNotificationsUpdating || !pushNotificationHealth?.providerConfigured
+                        }
+                        onPress={() => void sendNotificationTest()}
+                        style={({ pressed }) => [
+                          styles.notificationTestButton,
+                          pressed && styles.pressed,
+                          (pushNotificationsUpdating ||
+                            !pushNotificationHealth?.providerConfigured) &&
+                            styles.notificationTestButtonDisabled,
+                        ]}
+                      >
+                        <ThemedText type="smallBold">Send test notification</ThemedText>
+                      </Pressable>
+                    </View>
                   </>
                 ) : (
                   <ThemedText
@@ -580,7 +647,7 @@ export default function SettingsScreen() {
                     themeColor="textSecondary"
                     style={styles.notificationIntro}
                   >
-                    Push notifications are available in the iOS and Android apps.
+                    Direct push notifications are available in the iOS app.
                   </ThemedText>
                 )}
               </Animated.View>
@@ -956,6 +1023,10 @@ function rateLimitProgressColor(remainingPercent: number) {
   return "#93E1B6";
 }
 
+function formatNotificationTime(value: string | null) {
+  return value ? new Date(value).toLocaleString() : "never";
+}
+
 function settingsErrorMessage(error: unknown) {
   if (error instanceof Error && error.message) {
     return error.message;
@@ -1282,6 +1353,23 @@ const styles = StyleSheet.create({
   notificationSubtitle: {
     fontSize: 12,
     lineHeight: 16,
+  },
+  notificationHealth: {
+    gap: Spacing.two,
+    padding: Spacing.three,
+  },
+  notificationTestButton: {
+    alignItems: "center",
+    backgroundColor: "rgba(255, 255, 255, 0.08)",
+    borderColor: "rgba(255, 255, 255, 0.12)",
+    borderRadius: 7,
+    borderWidth: 1,
+    justifyContent: "center",
+    minHeight: 40,
+    paddingHorizontal: Spacing.three,
+  },
+  notificationTestButtonDisabled: {
+    opacity: 0.45,
   },
   usageCard: {
     backgroundColor: Colors.dark.backgroundElement,

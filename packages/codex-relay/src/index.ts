@@ -60,24 +60,19 @@ const preferencesStore = createFileRuntimePreferencesStore(
   process.env.CODEX_RELAY_PREFERENCES_PATH ?? (await prepareCodexRelayDataPath("preferences.json")),
 );
 const appServerMode = resolveCodexAppServerMode();
-const relayAppServer =
-  appServerMode.mode === "socket"
-    ? new CodexAppServerClient({
-        mode: appServerMode,
-        onStartupFallback: (error) => {
-          logRuntimeEvent(
-            "Fallback",
-            `Shared app-server unavailable; continuing with a private app-server (${error.message}).`,
-          );
-        },
-      })
-    : undefined;
-if (relayAppServer) {
-  await relayAppServer.initialize();
-  process.once("SIGINT", () => stopRelayAppServer(130));
-  process.once("SIGTERM", () => stopRelayAppServer(143));
-  process.once("exit", () => relayAppServer.close());
-}
+const relayAppServer = new CodexAppServerClient({
+  mode: appServerMode,
+  onStartupFallback: (error) => {
+    logRuntimeEvent(
+      "Fallback",
+      `Shared app-server unavailable; continuing with a private app-server (${error.message}).`,
+    );
+  },
+});
+await relayAppServer.initialize();
+process.once("SIGINT", () => stopRelayAppServer(130));
+process.once("SIGTERM", () => stopRelayAppServer(143));
+process.once("exit", () => relayAppServer.close());
 
 serve(
   {
@@ -176,7 +171,7 @@ serve(
         pairingPayload,
         port: info.port,
         sharedAppServerRemoteAddress:
-          relayAppServer?.appServerMode === "socket"
+          relayAppServer.appServerMode === "socket"
             ? resolveCodexSharedAppServerRemoteAddress()
             : undefined,
       }),
@@ -185,7 +180,7 @@ serve(
 );
 
 function stopRelayAppServer(exitCode: number) {
-  relayAppServer?.close();
+  relayAppServer.close();
   process.exit(exitCode);
 }
 
@@ -210,14 +205,14 @@ function formatStartupInstructions(details: {
     ...(details.sharedAppServerRemoteAddress
       ? [
           "",
-          `${color.prompt("›")} Terminal: ${color.command(`codex resume --remote ${details.sharedAppServerRemoteAddress}`)}`,
+          `${color.prompt("›")} Terminal: ${color.command(`codex --remote ${details.sharedAppServerRemoteAddress}`)}`,
           `  ${color.muted("Connect through the shared Codex app-server to follow and steer the same live sessions.")}`,
         ]
       : []),
     "",
     `${color.prompt("›")} Commands`,
     `  ${color.command(npxCommand)}              Start and print a pairing QR`,
-    `  ${color.command(`${npxCommand} --bg`)}         Start in the background`,
+    `  ${color.command(`${npxCommand} --shared-app-server --bg`)} Start shared in the background`,
     `  ${color.command(`${npxCommand} stop`)}         Stop the background relay`,
     `  ${color.command(`${npxCommand} qr`)}           Print this QR again`,
     `  ${color.command(`${npxCommand} approve <code>`)} Approve a device`,

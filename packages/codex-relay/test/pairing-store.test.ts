@@ -59,9 +59,10 @@ describe("pairing session store", () => {
     });
     await sessions.upsertPushNotificationSubscription({
       actionRequired: true,
+      bundleId: "com.allenneverland.codexrelay",
       clientSessionId: "phone-session",
-      expoPushToken: "ExponentPushToken[phone-token]",
-      platform: "ios",
+      deviceToken: "a".repeat(64),
+      environment: "development",
       turnTerminal: true,
     });
 
@@ -72,9 +73,10 @@ describe("pairing session store", () => {
 
     expect(await sessions.getPushNotificationSubscription("phone-session")).toEqual({
       actionRequired: true,
+      bundleId: "com.allenneverland.codexrelay",
       clientSessionId: "phone-session",
-      expoPushToken: "ExponentPushToken[phone-token]",
-      platform: "ios",
+      deviceToken: "a".repeat(64),
+      environment: "development",
       turnTerminal: true,
     });
     expect(await sessions.listActivePushNotificationSubscriptions()).toEqual([
@@ -90,9 +92,10 @@ describe("pairing session store", () => {
     });
     await sessions.upsertPushNotificationSubscription({
       actionRequired: true,
+      bundleId: "com.allenneverland.codexrelay",
       clientSessionId: "expired-phone",
-      expoPushToken: "ExponentPushToken[expired-phone]",
-      platform: "android",
+      deviceToken: "b".repeat(64),
+      environment: "production",
       turnTerminal: true,
     });
 
@@ -113,9 +116,10 @@ describe("pairing session store", () => {
     });
     await sessions.upsertPushNotificationSubscription({
       actionRequired: false,
+      bundleId: "com.allenneverland.codexrelay",
       clientSessionId: "active-phone",
-      expoPushToken: "ExponentPushToken[active-phone]",
-      platform: "android",
+      deviceToken: "c".repeat(64),
+      environment: "production",
       turnTerminal: true,
     });
     await sessions.clearAll();

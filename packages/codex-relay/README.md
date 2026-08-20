@@ -47,28 +47,30 @@ When a shared app-server is already running, the relay attaches to it instead of
 Then connect a new terminal TUI to the shared app-server. On macOS, Linux, or WSL:
 
 ```sh
-codex resume --remote unix://
+codex --remote unix://
 ```
 
 On native Windows, use the loopback WebSocket endpoint:
 
 ```powershell
-codex resume --remote ws://127.0.0.1:8788
+codex --remote ws://127.0.0.1:8788
 ```
 
 Pass a thread ID after the remote endpoint to open a specific thread. The relay prints the attach command at startup. Mobile and the connected terminal can then observe the same live sessions through one socket-backed app-server. An already-running standalone TUI cannot be converted in place; exit it and reconnect with `--remote`.
 
 Shared mode uses Codex's experimental app-server transport. A directly connected terminal TUI has its own WebSocket connection, which the relay cannot observe or reconnect. If that terminal reports a socket reset while the thread continues on mobile, reconnect it with the matching remote endpoint above and append the thread ID if needed.
 
-Shared mode requires a recent Codex CLI with app-server and `resume --remote` support. It uses a Unix socket on macOS, Linux, and WSL, or a loopback-only WebSocket on Windows. If explicit shared mode is unavailable, update Codex or omit `--shared-app-server`. On macOS, set `CODEX_RELAY_APP_SERVER_MODE=stdio` to force private mode instead of using the shared-first default.
+Shared mode requires a recent Codex CLI with app-server and `--remote` support. It uses a Unix socket on macOS, Linux, and WSL, or a loopback-only WebSocket on Windows. If explicit shared mode is unavailable, update Codex or omit `--shared-app-server`. On macOS, set `CODEX_RELAY_APP_SERVER_MODE=stdio` to force private mode instead of using the shared-first default.
 
 ## Background Mode
 
 To keep the relay running after the command returns:
 
 ```sh
-npx codex-relay@latest --bg
+npx codex-relay@latest --shared-app-server --bg
 ```
+
+Background mode always requires the shared app-server so tasks started by a connected Codex CLI can be observed for notification delivery.
 
 Background mode writes runtime files under `.codex-relay/` in the current directory:
 
@@ -98,7 +100,7 @@ npx codex-relay@latest
 Start the relay in the foreground.
 
 ```sh
-npx codex-relay@latest --bg
+npx codex-relay@latest --shared-app-server --bg
 ```
 
 Start the relay in the background.
@@ -148,6 +150,10 @@ The relay listens on `0.0.0.0:8787` by default. Configure it with environment va
 | `CODEX_RELAY_APP_SERVER_MODE`          | Set to `socket` to require shared mode or `stdio` to require private mode. Unset prefers shared mode with startup fallback on macOS and private mode elsewhere. |
 | `CODEX_HOME`                           | Codex home directory, used when reading Codex session metadata.                                                                                                 |
 | `CODEX_BIN`                            | Codex CLI executable path.                                                                                                                                      |
+| `CODEX_RELAY_APNS_KEY_PATH`            | Absolute path to the Apple Push Notification Auth Key (`.p8`).                                                                                                  |
+| `CODEX_RELAY_APNS_KEY_ID`              | Apple Push Notification Auth Key ID.                                                                                                                            |
+| `CODEX_RELAY_APNS_TEAM_ID`             | Apple Developer Team ID.                                                                                                                                        |
+| `CODEX_RELAY_APNS_TOPIC`               | APNs topic. Defaults to `com.allenneverland.codexrelay` and must match the iOS bundle ID.                                                                       |
 
 Examples:
 
@@ -158,6 +164,17 @@ PORT=8788 npx codex-relay@latest
 ```sh
 CODEX_RELAY_WORKSPACE_PATH=/path/to/project npx codex-relay@latest
 ```
+
+For direct iOS notifications, configure the APNs provider before starting the relay:
+
+```sh
+CODEX_RELAY_APNS_KEY_PATH=/absolute/path/AuthKey_ABC123.p8 \
+CODEX_RELAY_APNS_KEY_ID=ABC123 \
+CODEX_RELAY_APNS_TEAM_ID=TEAM123 \
+npx codex-relay@latest --shared-app-server --bg
+```
+
+The `.p8` file is read from disk and is never stored in the relay database. The Mac must remain awake and online for background delivery attempts.
 
 ## Network Notes
 

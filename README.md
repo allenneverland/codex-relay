@@ -104,13 +104,13 @@ When a shared app-server is already running, the relay attaches to it instead of
 Then attach a new terminal TUI. On macOS, Linux, or WSL:
 
 ```sh
-codex resume --remote unix://
+codex --remote unix://
 ```
 
 On native Windows:
 
 ```powershell
-codex resume --remote ws://127.0.0.1:8788
+codex --remote ws://127.0.0.1:8788
 ```
 
 An already-running standalone TUI cannot be converted in place. Exit it and reconnect with `--remote`. Shared mode requires a recent Codex CLI with app-server and remote-resume support. It uses a Unix socket on macOS, Linux, and WSL, or a loopback-only WebSocket on Windows.
@@ -124,7 +124,9 @@ After pairing, open **Settings > Notifications** in the mobile app and enable ei
 - **Turn complete** for completed or failed Codex turns
 - **Action required** for approval and input requests
 
-The relay sends only a generic alert plus opaque thread and turn identifiers needed to open the conversation. It does not send prompts, responses, commands, or approval text through the push service. Push support requires a native mobile build that includes `expo-notifications`; an OTA update alone cannot add that native module.
+The relay sends direct APNs alerts containing only generic text plus opaque event, thread, and turn identifiers. It does not send prompts, responses, commands, or approval text. Configure `CODEX_RELAY_APNS_KEY_PATH`, `CODEX_RELAY_APNS_KEY_ID`, and `CODEX_RELAY_APNS_TEAM_ID`, then keep the relay running with `npx codex-relay@latest --shared-app-server --bg`. The APNs topic defaults to `com.allenneverland.codexrelay`.
+
+Push support requires a development-signed native iOS build with the Push Notifications capability. An OTA update alone cannot add the entitlement or change the bundle ID.
 
 ## Network Setup
 
@@ -181,14 +183,14 @@ release pull request and publishes it after that pull request is merged. See
 
 ## Common Commands
 
-| Command                                      | What it does                                        |
-| -------------------------------------------- | --------------------------------------------------- |
-| `npx codex-relay@latest`                     | Start the relay and print a pairing QR.             |
-| `npx codex-relay@latest --bg`                | Keep the relay running in the background.           |
-| `npx codex-relay@latest --shared-app-server` | Share live sessions with an attached terminal TUI.  |
-| `npx codex-relay@latest qr`                  | Print the current pairing QR for an existing relay. |
-| `npx codex-relay@latest approve XXXX-XXXX`   | Approve a pending mobile pairing request.           |
-| `npx codex-relay@latest clear`               | Sign out every paired mobile app.                   |
+| Command                                           | What it does                                        |
+| ------------------------------------------------- | --------------------------------------------------- |
+| `npx codex-relay@latest`                          | Start the relay and print a pairing QR.             |
+| `npx codex-relay@latest --shared-app-server --bg` | Keep the shared relay running in the background.    |
+| `npx codex-relay@latest --shared-app-server`      | Share live sessions with an attached terminal TUI.  |
+| `npx codex-relay@latest qr`                       | Print the current pairing QR for an existing relay. |
+| `npx codex-relay@latest approve XXXX-XXXX`        | Approve a pending mobile pairing request.           |
+| `npx codex-relay@latest clear`                    | Sign out every paired mobile app.                   |
 
 ## Configuration
 
@@ -201,6 +203,10 @@ The relay listens on `0.0.0.0:8787` by default.
 | `CODEX_RELAY_WORKSPACE_PATH`  | Workspace path Codex should use. Defaults to the current directory. |
 | `CODEX_RELAY_AUTH_DB_PATH`    | Pairing and session database path.                                  |
 | `CODEX_RELAY_APP_SERVER_MODE` | `socket` for shared terminal/mobile sessions; defaults to `stdio`.  |
+| `CODEX_RELAY_APNS_KEY_PATH`   | Absolute path to the Apple Push Notification Auth Key (`.p8`).      |
+| `CODEX_RELAY_APNS_KEY_ID`     | Apple Push Notification Auth Key ID.                                |
+| `CODEX_RELAY_APNS_TEAM_ID`    | Apple Developer Team ID.                                            |
+| `CODEX_RELAY_APNS_TOPIC`      | APNs topic; defaults to `com.allenneverland.codexrelay`.            |
 | `CODEX_BIN`                   | Codex CLI executable path.                                          |
 | `CODEX_HOME`                  | Codex home directory for reading local session metadata.            |
 

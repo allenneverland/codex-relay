@@ -1,12 +1,9 @@
-import Constants from "expo-constants";
+import * as Application from "expo-application";
 import * as Notifications from "expo-notifications";
 import type { PushNotificationPreferences } from "codex-relay/api-schema";
 import { Platform } from "react-native";
 
-import { codexRelayStorage } from "./codex-relay-server-url-storage";
-
-const initialPushNotificationRegistrationStorageKey =
-  "codex-relay.initial-push-notification-registration-completed";
+export const codexRelayBundleId = "com.allenneverland.codexrelay";
 
 export const defaultPushNotificationPreferences: PushNotificationPreferences = {
   actionRequired: true,
@@ -38,18 +35,11 @@ export function configurePushNotificationPresentation() {
 }
 
 export function supportsPushNotifications() {
-  return Platform.OS === "android" || Platform.OS === "ios";
+  return Platform.OS === "ios";
 }
 
-export async function getExpoPushToken() {
-  const platform = pushNotificationPlatform();
-  if (platform === "android") {
-    await Notifications.setNotificationChannelAsync("default", {
-      importance: Notifications.AndroidImportance.DEFAULT,
-      name: "Codex Relay",
-    });
-  }
-
+export async function getApnsPushRegistration() {
+  assertIosBundle();
   const existingPermissions = await Notifications.getPermissionsAsync();
   const permissions =
     existingPermissions.status === "granted"
@@ -58,42 +48,51 @@ export async function getExpoPushToken() {
   if (permissions.status !== "granted") {
     throw new PushNotificationPermissionDeniedError();
   }
+  return apnsPushRegistrationFromToken(await Notifications.getDevicePushTokenAsync());
+}
 
-  const projectId = expoProjectId();
-  if (!projectId) {
-    throw new Error("This app build is missing its Expo project identifier.");
+export async function apnsPushRegistrationFromToken(token: Notifications.DevicePushToken) {
+  assertIosBundle();
+  if (token.type !== "ios" || typeof token.data !== "string" || !token.data.trim()) {
+    throw new Error("iOS did not return a valid APNs device token.");
   }
-  return (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+  const environment = await Application.getIosPushNotificationServiceEnvironmentAsync();
+  if (environment !== "development" && environment !== "production") {
+    throw new Error("This iOS build does not expose an APNs environment.");
+  }
+  return {
+    bundleId: codexRelayBundleId,
+    deviceToken: token.data.replaceAll(/[< >]/g, ""),
+    environment,
+    provider: "apns" as const,
+  };
 }
 
-export function hasCompletedInitialPushNotificationRegistration() {
-  return codexRelayStorage.getBoolean(initialPushNotificationRegistrationStorageKey) ?? false;
-}
-
-export function markInitialPushNotificationRegistrationCompleted() {
-  codexRelayStorage.set(initialPushNotificationRegistrationStorageKey, true);
+export function addApnsPushTokenListener(
+  listener: (registration: Awaited<ReturnType<typeof getApnsPushRegistration>>) => void,
+) {
+  return Notifications.addPushTokenListener((token) => {
+    void apnsPushRegistrationFromToken(token)
+      .then(listener)
+      .catch(() => undefined);
+  });
 }
 
 export function notificationResponseThreadId(response: Notifications.NotificationResponse) {
   const data = response.notification.request.content.data;
   const threadId = data?.threadId;
-  return typeof threadId === "string" && threadId.trim() ? threadId : undefined;
-}
-
-export function pushNotificationPlatform(): "android" | "ios" {
-  if (Platform.OS === "android" || Platform.OS === "ios") {
-    return Platform.OS;
-  }
-  throw new Error("Push notifications are available only in the iOS and Android apps.");
-}
-
-function expoProjectId() {
-  const easProjectId = Constants.easConfig?.projectId;
-  if (typeof easProjectId === "string" && easProjectId.trim()) {
-    return easProjectId;
-  }
-  const configProjectId = Constants.expoConfig?.extra?.eas?.projectId;
-  return typeof configProjectId === "string" && configProjectId.trim()
-    ? configProjectId
+  return typeof threadId === "string" && threadId.trim() && threadId !== "test"
+    ? threadId
     : undefined;
+}
+
+function assertIosBundle() {
+  if (Platform.OS !== "ios") {
+    throw new Error("Direct APNs notifications are available only in the iOS app.");
+  }
+  if (Application.applicationId !== codexRelayBundleId) {
+    throw new Error(
+      `Expected bundle ID ${codexRelayBundleId}, received ${Application.applicationId ?? "unknown"}.`,
+    );
+  }
 }

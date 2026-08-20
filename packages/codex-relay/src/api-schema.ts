@@ -95,7 +95,7 @@ export const RuntimePreferencesResponseSchema = z.object({
   workspacePath: z.string().trim().min(1).optional(),
 });
 
-export const PushNotificationIntentSchema = z.enum(["turn_terminal", "action_required"]);
+export const PushNotificationIntentSchema = z.enum(["turn_terminal", "action_required", "test"]);
 
 export const PushNotificationPreferencesSchema = z.object({
   actionRequired: z.boolean(),
@@ -103,17 +103,35 @@ export const PushNotificationPreferencesSchema = z.object({
 });
 
 export const RegisterPushNotificationRequestSchema = z.object({
-  expoPushToken: z
+  provider: z.literal("apns"),
+  deviceToken: z
     .string()
     .trim()
-    .regex(/^(?:Expo|Exponent)PushToken\[[^\]\r\n]{1,512}\]$/),
-  platform: z.enum(["android", "ios"]),
+    .regex(/^[a-fA-F0-9]{32,512}$/),
+  environment: z.enum(["development", "production"]),
+  bundleId: z.string().trim().min(1),
   preferences: PushNotificationPreferencesSchema,
+});
+
+export const PushNotificationDeliveryHealthSchema = z.object({
+  providerConfigured: z.boolean(),
+  environment: z.enum(["development", "production"]).nullable(),
+  pendingCount: z.number().int().nonnegative(),
+  lastAcceptedAt: IsoDateTimeSchema.nullable(),
+  lastErrorCode: z.string().nullable(),
 });
 
 export const PushNotificationSettingsResponseSchema = z.object({
   preferences: PushNotificationPreferencesSchema,
   registered: z.boolean(),
+  provider: z.literal("apns"),
+  environment: z.enum(["development", "production"]).nullable(),
+  health: PushNotificationDeliveryHealthSchema,
+});
+
+export const PushNotificationTestResponseSchema = z.object({
+  accepted: z.boolean(),
+  health: PushNotificationDeliveryHealthSchema,
 });
 
 export const CodexModelSchema = z.object({
@@ -790,9 +808,11 @@ export type RuntimePreferencesResponse = z.infer<typeof RuntimePreferencesRespon
 export type PushNotificationIntent = z.infer<typeof PushNotificationIntentSchema>;
 export type PushNotificationPreferences = z.infer<typeof PushNotificationPreferencesSchema>;
 export type RegisterPushNotificationRequest = z.infer<typeof RegisterPushNotificationRequestSchema>;
+export type PushNotificationDeliveryHealth = z.infer<typeof PushNotificationDeliveryHealthSchema>;
 export type PushNotificationSettingsResponse = z.infer<
   typeof PushNotificationSettingsResponseSchema
 >;
+export type PushNotificationTestResponse = z.infer<typeof PushNotificationTestResponseSchema>;
 export type ContextWindowUsage = z.infer<typeof ContextWindowUsageSchema>;
 export type RateLimitBucket = z.infer<typeof RateLimitBucketSchema>;
 export type RateLimitWindow = z.infer<typeof RateLimitWindowSchema>;
@@ -1077,6 +1097,7 @@ export const apiPaths = {
   status: "/v1/status",
   preferences: "/v1/preferences",
   pushNotifications: "/v1/notifications/push",
+  pushNotificationsTest: "/v1/notifications/push/test",
   rateLimits: "/v1/rate-limits",
   models: "/v1/models",
   skills: "/v1/skills",
@@ -1179,6 +1200,16 @@ export function createOpenApiDocument() {
           responses: {
             "200": jsonResponse("PushNotificationSettingsResponse"),
             "401": jsonResponse("ErrorResponse"),
+          },
+        },
+      },
+      "/v1/notifications/push/test": {
+        post: {
+          summary: "Send a test push notification to this paired device",
+          responses: {
+            "200": jsonResponse("PushNotificationTestResponse"),
+            "401": jsonResponse("ErrorResponse"),
+            "503": jsonResponse("ErrorResponse"),
           },
         },
       },
@@ -1640,22 +1671,58 @@ export function createOpenApiDocument() {
         },
         RegisterPushNotificationRequest: {
           type: "object",
-          required: ["expoPushToken", "platform", "preferences"],
+          required: ["provider", "deviceToken", "environment", "bundleId", "preferences"],
           properties: {
-            expoPushToken: {
+            provider: { type: "string", enum: ["apns"] },
+            deviceToken: {
               type: "string",
-              pattern: "^(?:Expo|Exponent)PushToken\\[[^\\]\\r\\n]{1,512}\\]$",
+              pattern: "^[a-fA-F0-9]{32,512}$",
             },
-            platform: { type: "string", enum: ["android", "ios"] },
+            environment: { type: "string", enum: ["development", "production"] },
+            bundleId: { type: "string" },
             preferences: { $ref: "#/components/schemas/PushNotificationPreferences" },
+          },
+        },
+        PushNotificationDeliveryHealth: {
+          type: "object",
+          required: [
+            "providerConfigured",
+            "environment",
+            "pendingCount",
+            "lastAcceptedAt",
+            "lastErrorCode",
+          ],
+          properties: {
+            providerConfigured: { type: "boolean" },
+            environment: {
+              type: ["string", "null"],
+              enum: ["development", "production", null],
+            },
+            pendingCount: { type: "integer", minimum: 0 },
+            lastAcceptedAt: { type: ["string", "null"], format: "date-time" },
+            lastErrorCode: { type: ["string", "null"] },
           },
         },
         PushNotificationSettingsResponse: {
           type: "object",
-          required: ["preferences", "registered"],
+          required: ["preferences", "registered", "provider", "environment", "health"],
           properties: {
             preferences: { $ref: "#/components/schemas/PushNotificationPreferences" },
             registered: { type: "boolean" },
+            provider: { type: "string", enum: ["apns"] },
+            environment: {
+              type: ["string", "null"],
+              enum: ["development", "production", null],
+            },
+            health: { $ref: "#/components/schemas/PushNotificationDeliveryHealth" },
+          },
+        },
+        PushNotificationTestResponse: {
+          type: "object",
+          required: ["accepted", "health"],
+          properties: {
+            accepted: { type: "boolean" },
+            health: { $ref: "#/components/schemas/PushNotificationDeliveryHealth" },
           },
         },
         WorkspaceDirectoryEntry: {
