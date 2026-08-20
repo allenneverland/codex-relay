@@ -6,7 +6,7 @@ import {
   type MaintainVisibleContentPositionConfig,
 } from "@legendapp/list/react-native";
 import { KeyboardAwareLegendList } from "@legendapp/list/keyboard";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ActivityIndicator, View } from "react-native";
 import { StyleSheet } from "react-native-unistyles";
 import Animated, {
@@ -23,6 +23,7 @@ import { ThemedText } from "@/components/themed-text";
 import { Colors, Spacing } from "@/constants/theme";
 
 import { MessageBubble } from "./MessageBubble";
+import { CommentaryGroup } from "./CommentaryGroup";
 import { messageItemType, messageKeyExtractor } from "./timeline-message-items";
 import type { WorkspaceMarkdownPreviewTarget } from "./workspace-preview/markdown-target";
 import { RunningFooter } from "./RunningFooter";
@@ -38,7 +39,17 @@ const MAINTAIN_SCROLL_AT_END: MaintainScrollAtEndOptions = {
     layout: true,
   },
 };
-const MAINTAIN_VISIBLE_CONTENT_POSITION: MaintainVisibleContentPositionConfig<ChatMessage> = {
+type TimelineRow =
+  | { type: "message"; message: ChatMessage }
+  | {
+      type: "commentary";
+      id: string;
+      isActive: boolean;
+      messages: ChatMessage[];
+      turnId: string;
+    };
+
+const MAINTAIN_VISIBLE_CONTENT_POSITION: MaintainVisibleContentPositionConfig<TimelineRow> = {
   data: false,
   size: true,
 };
@@ -72,7 +83,7 @@ export function MessageTimeline({
 }) {
   const listRef = useRef<LegendListRef | null>(null);
   const { bottom } = useSafeAreaInsets();
-  const rows = messages;
+  const rows = useMemo(() => timelineRows(messages, isRunning), [isRunning, messages]);
   const timelineKey = threadId ?? "no-thread";
   const [settledTimelineKey, setSettledTimelineKey] = useState<string | undefined>(undefined);
   const extraContentPadding = useSharedValue(0);
@@ -126,14 +137,23 @@ export function MessageTimeline({
   }, [contentRevealProgress, showLoadingConversation]);
 
   const renderMessage = useCallback(
-    ({ item }: LegendListRenderItemProps<ChatMessage>) => (
-      <MessageBubble
-        message={item}
-        onMessageCopied={onMessageCopied}
-        onMessageRewind={onMessageRewind}
-        onOpenMarkdownAttachment={onOpenMarkdownAttachment}
-      />
-    ),
+    ({ item }: LegendListRenderItemProps<TimelineRow>) =>
+      item.type === "commentary" ? (
+        <CommentaryGroup
+          isActive={item.isActive}
+          messages={item.messages}
+          onMessageCopied={onMessageCopied}
+          onOpenMarkdownAttachment={onOpenMarkdownAttachment}
+          turnId={item.turnId}
+        />
+      ) : (
+        <MessageBubble
+          message={item.message}
+          onMessageCopied={onMessageCopied}
+          onMessageRewind={onMessageRewind}
+          onOpenMarkdownAttachment={onOpenMarkdownAttachment}
+        />
+      ),
     [onMessageCopied, onMessageRewind, onOpenMarkdownAttachment],
   );
   const handleTimelineLoad = useCallback(() => {
@@ -165,9 +185,9 @@ export function MessageTimeline({
               data={rows}
               estimatedItemSize={MESSAGE_ESTIMATED_ITEM_SIZE}
               freeze={keyboardLayoutFrozen}
-              getItemType={messageItemType}
+              getItemType={timelineRowType}
               initialScrollAtEnd
-              keyExtractor={messageKeyExtractor}
+              keyExtractor={timelineRowKey}
               renderItem={renderMessage}
               contentContainerStyle={styles.content}
               keyboardDismissMode="interactive"
@@ -201,6 +221,50 @@ export function MessageTimeline({
       ) : null}
     </View>
   );
+}
+
+function timelineRows(messages: ChatMessage[], isRunning: boolean): TimelineRow[] {
+  const latestTurnId = messages.findLast((message) => message.turnId)?.turnId;
+  const finalTurnIds = new Set(
+    messages.flatMap((message) =>
+      message.phase === "final_answer" && message.turnId ? [message.turnId] : [],
+    ),
+  );
+  const commentaryByTurnId = new Map<string, Extract<TimelineRow, { type: "commentary" }>>();
+  const rows: TimelineRow[] = [];
+
+  for (const message of messages) {
+    if (message.role !== "assistant" || message.phase !== "commentary" || !message.turnId) {
+      rows.push({ type: "message", message });
+      continue;
+    }
+
+    const existing = commentaryByTurnId.get(message.turnId);
+    if (existing) {
+      existing.messages.push(message);
+      continue;
+    }
+
+    const row: Extract<TimelineRow, { type: "commentary" }> = {
+      type: "commentary",
+      id: `commentary:${message.turnId}`,
+      isActive: isRunning && message.turnId === latestTurnId && !finalTurnIds.has(message.turnId),
+      messages: [message],
+      turnId: message.turnId,
+    };
+    commentaryByTurnId.set(message.turnId, row);
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function timelineRowKey(row: TimelineRow) {
+  return row.type === "commentary" ? row.id : messageKeyExtractor(row.message);
+}
+
+function timelineRowType(row: TimelineRow) {
+  return row.type === "commentary" ? "commentary" : messageItemType(row.message);
 }
 
 function LoadingConversation() {

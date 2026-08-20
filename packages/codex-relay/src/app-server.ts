@@ -94,7 +94,12 @@ export type AppServerThreadItem =
       id: string;
       content: AppServerUserInput[];
     }
-  | { type: "agentMessage"; id: string; text: string }
+  | {
+      type: "agentMessage";
+      id: string;
+      text: string;
+      phase?: "commentary" | "final_answer" | null;
+    }
   | {
       type: "plan";
       id: string;

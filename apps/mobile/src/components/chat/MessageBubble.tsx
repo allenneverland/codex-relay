@@ -111,16 +111,19 @@ export const MessageBubble = memo(function MessageBubble({
   onMessageCopied,
   onMessageRewind,
   onOpenMarkdownAttachment,
+  presentation = "default",
 }: {
   message: ChatMessage;
   onMessageCopied?: () => void;
   onMessageRewind?: (message: ChatMessage) => void;
   onOpenMarkdownAttachment?: (target: WorkspaceMarkdownPreviewTarget) => void;
+  presentation?: "commentary" | "default";
 }) {
   const theme = useTheme();
   const isUser = message.role === "user";
   const isAssistant = message.role === "assistant";
   const isError = message.role === "error";
+  const isCommentary = presentation === "commentary";
   const isMeta =
     message.role === "status" || message.role === "tool" || message.role === "reasoning";
   const messageContent = message.content;
@@ -329,7 +332,13 @@ export const MessageBubble = memo(function MessageBubble({
   }
 
   return (
-    <View style={[styles.row, isUser ? styles.userRow : styles.assistantRow]}>
+    <View
+      style={[
+        styles.row,
+        isUser ? styles.userRow : styles.assistantRow,
+        isCommentary && styles.commentaryRow,
+      ]}
+    >
       <View
         style={[
           styles.bubble,
@@ -340,9 +349,11 @@ export const MessageBubble = memo(function MessageBubble({
       >
         {isAssistant ? (
           <View style={styles.assistantContent}>
-            <ThemedText type="code" themeColor="textSecondary" style={styles.assistantLabel}>
-              Codex
-            </ThemedText>
+            {!isCommentary ? (
+              <ThemedText type="code" themeColor="textSecondary" style={styles.assistantLabel}>
+                Codex
+              </ThemedText>
+            ) : null}
             {markdownSegments.map((segment) =>
               segment.kind === "code" ? (
                 <HighlightedCodeBlock
@@ -369,13 +380,15 @@ export const MessageBubble = memo(function MessageBubble({
               messageId={message.id}
               onOpenMarkdownAttachment={onOpenMarkdownAttachment}
             />
-            <MessageFooter
-              canCopy={copyMarkdown.length > 0}
-              isCopied={isCopied}
-              onCopyPress={handleCopyPress}
-              timestamp={timestamp}
-              variant="assistant"
-            />
+            {!isCommentary ? (
+              <MessageFooter
+                canCopy={copyMarkdown.length > 0}
+                isCopied={isCopied}
+                onCopyPress={handleCopyPress}
+                timestamp={timestamp}
+                variant="assistant"
+              />
+            ) : null}
           </View>
         ) : (
           <View style={styles.userContent}>
@@ -1188,6 +1201,9 @@ const styles = StyleSheet.create({
   },
   assistantRow: {
     alignItems: "stretch",
+  },
+  commentaryRow: {
+    marginVertical: Spacing.one,
   },
   bubble: {
     borderRadius: 18,

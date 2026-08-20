@@ -79,7 +79,12 @@ function appServerHistoryThread(input: {
   turns: Array<{
     id: string;
     items: Array<
-      | { id: string; type: "agentMessage"; text: string }
+      | {
+          id: string;
+          type: "agentMessage";
+          text: string;
+          phase?: "commentary" | "final_answer";
+        }
       | {
           id: string;
           type: "userMessage";
@@ -4491,6 +4496,7 @@ describe("Codex Relay server routes", () => {
               params: {
                 item: {
                   id: "assistant-canonical",
+                  phase: "commentary",
                   text: "Remembered",
                   type: "agentMessage",
                 },
@@ -4541,6 +4547,7 @@ describe("Codex Relay server routes", () => {
               message?: {
                 details?: { replacesMessageId?: string };
                 id: string;
+                phase?: string;
                 role: string;
                 turnId?: string;
               };
@@ -4560,6 +4567,12 @@ describe("Codex Relay server routes", () => {
       turnId: "turn-canonical-user",
       details: { replacesMessageId: userEvents[0]?.message?.id },
     });
+    expect(
+      events.find(
+        (event) =>
+          event.type === "thread.message.completed" && event.message?.id === "assistant-canonical",
+      )?.message,
+    ).toMatchObject({ phase: "commentary", turnId: "turn-canonical-user" });
   });
 
   it("streams current app-server collaboration items as subagent activity", async () => {
@@ -6601,6 +6614,94 @@ describe("Codex Relay server routes", () => {
     expect(body).not.toHaveProperty("olderMessagesCursor");
   });
 
+  it("preserves app-server message phases and omits orphan synthetic turns", async () => {
+    const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
+    const now = Date.now() / 1000;
+    const thread = {
+      id: "app-thread-phases",
+      createdAt: now,
+      cwd: workspacePath,
+      modelProvider: "gpt-5.5",
+      name: "Message phases",
+      preview: "Message phases",
+      source: "app",
+      status: { type: "idle" },
+      turns: [
+        {
+          id: "turn-visible",
+          completedAt: now,
+          items: [
+            {
+              id: "user-visible",
+              type: "userMessage",
+              content: [{ type: "text", text: "Visible prompt", text_elements: [] }],
+            },
+            {
+              id: "commentary-visible",
+              phase: "commentary",
+              text: "Visible progress",
+              type: "agentMessage",
+            },
+            {
+              id: "answer-visible",
+              phase: "final_answer",
+              text: "Visible answer",
+              type: "agentMessage",
+            },
+          ],
+          startedAt: now - 1,
+          status: { type: "completed" },
+        },
+        {
+          id: "rollout-orphan",
+          completedAt: null,
+          items: [
+            {
+              id: "commentary-orphan",
+              phase: "commentary",
+              text: "Unrelated progress",
+              type: "agentMessage",
+            },
+            {
+              id: "answer-orphan",
+              phase: "final_answer",
+              text: "Unrelated answer",
+              type: "agentMessage",
+            },
+          ],
+          startedAt: null,
+          status: { type: "completed" },
+        },
+      ],
+      updatedAt: now,
+    };
+    const readThread = vi.fn<() => Promise<unknown>>(async () => thread);
+    const app = createApp({
+      appServer: {
+        listThreads: vi.fn<() => Promise<unknown[]>>(async () => [thread]),
+        onNotification() {
+          return () => undefined;
+        },
+        onRequest() {
+          return () => undefined;
+        },
+        readThread,
+      } as never,
+      codex: createMockCodex(),
+      workspacePath,
+    });
+
+    const response = await app.request(`/v1/threads/${thread.id}?refresh=true`);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.messages).toMatchObject([
+      { id: "user-visible", role: "user" },
+      { id: "commentary-visible", phase: "commentary", role: "assistant" },
+      { id: "answer-visible", phase: "final_answer", role: "assistant" },
+    ]);
+  });
+
   it("loads app-server history from the rollout file when full thread reads hang", async () => {
     const workspacePath = await mkdtemp(join(tmpdir(), "codex-relay-workspace-"));
     const codexHome = await mkdtemp(join(tmpdir(), "codex-relay-home-"));
@@ -6753,6 +6854,7 @@ describe("Codex Relay server routes", () => {
         JSON.stringify({
           payload: {
             message: `증거 스크린샷:\n![WorkspacePreview on iPhone 17](${imagePath})\n\n완료`,
+            turn_id: "turn-assistant-image",
             type: "agent_message",
           },
           timestamp: "2026-05-02T00:00:00.000Z",
@@ -6814,6 +6916,7 @@ describe("Codex Relay server routes", () => {
                 unified_diff: patch,
               },
             },
+            turn_id: "turn-patch",
             type: "patch_apply_end",
           },
           timestamp: "2026-05-02T00:00:00.000Z",
@@ -6876,6 +6979,7 @@ describe("Codex Relay server routes", () => {
                 unified_diff: ["@@ -3,2 +3 @@", "-old", " kept"].join("\n"),
               },
             },
+            turn_id: "turn-bare-patch",
             type: "patch_apply_end",
           },
           timestamp: "2026-05-02T00:00:00.000Z",
@@ -6974,6 +7078,7 @@ describe("Codex Relay server routes", () => {
             call_id: "call_apply_patch",
             input: patch,
             name: "apply_patch",
+            turn_id: "turn-apply-patch",
             type: "custom_tool_call",
           },
           timestamp: "2026-05-02T00:00:00.000Z",
@@ -7265,6 +7370,17 @@ describe("Codex Relay server routes", () => {
       [
         JSON.stringify({
           payload: {
+            content: [{ text: "orphan rollout progress", type: "output_text" }],
+            id: "msg-assistant-orphan",
+            phase: "commentary",
+            role: "assistant",
+            type: "message",
+          },
+          timestamp: "2026-08-14T23:59:59.000Z",
+          type: "response_item",
+        }),
+        JSON.stringify({
+          payload: {
             content: [{ text: "current rollout prompt", type: "input_text" }],
             id: "msg-user-current",
             role: "user",
@@ -7343,16 +7459,25 @@ describe("Codex Relay server routes", () => {
       expect(readThread).toHaveBeenCalledWith(threadId, { includeTurns: false });
       expect(body.thread.state).toBe("running");
       expect(
-        body.messages.map((message: { content: string; id: string; role: string }) => ({
-          content: message.content,
-          id: message.id,
-          role: message.role,
-        })),
+        body.messages.map(
+          (message: { content: string; id: string; phase?: string; role: string }) => ({
+            content: message.content,
+            id: message.id,
+            phase: message.phase,
+            role: message.role,
+          }),
+        ),
       ).toEqual([
-        { content: "current rollout prompt", id: "msg-user-current", role: "user" },
+        {
+          content: "current rollout prompt",
+          id: "msg-user-current",
+          phase: undefined,
+          role: "user",
+        },
         {
           content: "current rollout answer",
           id: "msg-assistant-current",
+          phase: "final_answer",
           role: "assistant",
         },
       ]);

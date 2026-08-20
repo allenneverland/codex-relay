@@ -5179,7 +5179,7 @@ function appendMessage(
   messagesByThreadId: Map<string, ChatMessage[]>,
   threadId: string,
   input: Pick<ChatMessage, "role" | "content"> &
-    Partial<Pick<ChatMessage, "details" | "kind" | "state" | "turnId">>,
+    Partial<Pick<ChatMessage, "details" | "kind" | "phase" | "state" | "turnId">>,
 ) {
   const now = new Date().toISOString();
   const message = ChatMessageSchema.parse({
@@ -5193,6 +5193,7 @@ function appendMessage(
     updatedAt: now,
     state: input.state,
     turnId: input.turnId,
+    phase: input.phase,
   });
   const messages = messagesByThreadId.get(threadId) ?? [];
   messages.push(message);
@@ -5205,7 +5206,7 @@ function appendMessageWithId(
   threadId: string,
   id: string,
   input: Pick<ChatMessage, "role" | "content"> &
-    Partial<Pick<ChatMessage, "details" | "kind" | "state" | "turnId">>,
+    Partial<Pick<ChatMessage, "details" | "kind" | "phase" | "state" | "turnId">>,
 ) {
   const now = new Date().toISOString();
   const message = ChatMessageSchema.parse({
@@ -5219,6 +5220,7 @@ function appendMessageWithId(
     updatedAt: now,
     state: input.state,
     turnId: input.turnId,
+    phase: input.phase,
   });
   const messages = messagesByThreadId.get(threadId) ?? [];
   messages.push(message);
@@ -5247,6 +5249,7 @@ function upsertAppServerItemMessage(
     kind: message.kind,
     content: message.content,
     details: message.details,
+    phase: message.phase,
     state: message.state,
     turnId: message.turnId,
   });
@@ -6432,6 +6435,9 @@ function preserveKnownRunningThreadState(thread: ThreadMetadata, wasKnownRunning
 function mapAppServerMessages(thread: AppServerThread): ChatMessage[] {
   const messages: ChatMessage[] = [];
   for (const turn of thread.turns ?? []) {
+    if (isOrphanSyntheticTurn(turn)) {
+      continue;
+    }
     for (const item of turn.items ?? []) {
       const message = mapAppServerItem(thread.id, turn, item);
       if (message) {
@@ -6442,14 +6448,24 @@ function mapAppServerMessages(thread: AppServerThread): ChatMessage[] {
   return messages;
 }
 
+function isOrphanSyntheticTurn(turn: AppServerTurn) {
+  return (
+    turn.id.startsWith("rollout-") &&
+    turn.startedAt === null &&
+    turn.completedAt === null &&
+    !turn.items.some((item) => item.type === "userMessage")
+  );
+}
+
 function mergeAppServerMessagesWithLocalStatus(
   appMessages: ChatMessage[],
   localMessages: ChatMessage[],
 ) {
   const appMessageIds = new Set(appMessages.map((message) => message.id));
-  const localStatusMessages = localMessages.filter(
-    (message) => message.role === "status" && !appMessageIds.has(message.id),
-  );
+  const localStatusMessages = cachedMessagesWithoutOrphanSyntheticTurns(
+    localMessages,
+    appMessages,
+  ).filter((message) => message.role === "status" && !appMessageIds.has(message.id));
   return [...appMessages, ...localStatusMessages].sort((left, right) =>
     left.createdAt.localeCompare(right.createdAt),
   );
@@ -6457,13 +6473,36 @@ function mergeAppServerMessagesWithLocalStatus(
 
 function mergeThreadMessagePages(incomingMessages: ChatMessage[], cachedMessages: ChatMessage[]) {
   const byId = new Map<string, ChatMessage>();
-  for (const message of cachedMessages) {
+  for (const message of cachedMessagesWithoutOrphanSyntheticTurns(
+    cachedMessages,
+    incomingMessages,
+  )) {
     byId.set(message.id, message);
   }
   for (const message of incomingMessages) {
     byId.set(message.id, message);
   }
   return dedupeThreadMessages(Array.from(byId.values()));
+}
+
+function cachedMessagesWithoutOrphanSyntheticTurns(
+  cachedMessages: ChatMessage[],
+  authoritativeMessages: ChatMessage[],
+) {
+  const visibleSyntheticTurnIds = new Set(
+    authoritativeMessages.flatMap((message) =>
+      message.turnId?.startsWith("rollout-") ? [message.turnId] : [],
+    ),
+  );
+  for (const message of cachedMessages) {
+    if (message.role === "user" && message.turnId?.startsWith("rollout-")) {
+      visibleSyntheticTurnIds.add(message.turnId);
+    }
+  }
+  return cachedMessages.filter(
+    (message) =>
+      !message.turnId?.startsWith("rollout-") || visibleSyntheticTurnIds.has(message.turnId),
+  );
 }
 
 function dedupeThreadMessages(messages: ChatMessage[]) {
@@ -6685,6 +6724,7 @@ function readRolloutThreadMessages(threadId: string, workspacePath = defaultWork
   const handledApplyPatchCallIds = new Set<string>();
   const pendingApplyPatchChanges: RolloutPatchChange[] = [];
   let activeTurnId: string | undefined;
+  let hasVisibleTurnContext = false;
   const lines = readFileSync(rolloutPath, "utf8").split("\n");
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!;
@@ -6701,26 +6741,45 @@ function readRolloutThreadMessages(threadId: string, workspacePath = defaultWork
         timestamp?: unknown;
         type?: unknown;
       };
-      activeTurnId = firstString(record.payload, ["turn_id", "turnId"]) ?? activeTurnId;
-      rememberRolloutApplyPatchInput(record, applyPatchInputs);
-      collectRolloutApplyPatchOutput(
-        record,
-        workspacePath,
-        applyPatchInputs,
-        handledApplyPatchCallIds,
-        pendingApplyPatchChanges,
-      );
-      if (isRolloutTaskComplete(record) && pendingApplyPatchChanges.length > 0) {
-        collected.push(
-          rolloutApplyPatchSummaryMessage(
-            threadId,
-            record,
-            `rollout:${lineNumber}:apply_patch`,
-            pendingApplyPatchChanges,
-          ),
+      const taskCompleted = isRolloutTaskComplete(record);
+      const recordTurnId = firstString(record.payload, ["turn_id", "turnId"]);
+      if (recordTurnId) {
+        activeTurnId = recordTurnId;
+      }
+      if (
+        isRolloutUserMessageRecord(record) ||
+        (!taskCompleted && Boolean(recordTurnId) && !recordTurnId?.startsWith("rollout-"))
+      ) {
+        hasVisibleTurnContext = true;
+      }
+      if (hasVisibleTurnContext) {
+        rememberRolloutApplyPatchInput(record, applyPatchInputs);
+        collectRolloutApplyPatchOutput(
+          record,
+          workspacePath,
+          applyPatchInputs,
+          handledApplyPatchCallIds,
+          pendingApplyPatchChanges,
         );
+      }
+      if (taskCompleted) {
+        if (hasVisibleTurnContext && pendingApplyPatchChanges.length > 0) {
+          collected.push(
+            rolloutApplyPatchSummaryMessage(
+              threadId,
+              record,
+              `rollout:${lineNumber}:apply_patch`,
+              pendingApplyPatchChanges,
+            ),
+          );
+        }
         pendingApplyPatchChanges.length = 0;
+        applyPatchInputs.clear();
         activeTurnId = undefined;
+        hasVisibleTurnContext = false;
+        continue;
+      }
+      if (!hasVisibleTurnContext) {
         continue;
       }
       const message = rolloutRecordMessage(
@@ -6730,9 +6789,6 @@ function readRolloutThreadMessages(threadId: string, workspacePath = defaultWork
         workspacePath,
         activeTurnId,
       );
-      if (isRolloutTaskComplete(record)) {
-        activeTurnId = undefined;
-      }
       if (!message) {
         continue;
       }
@@ -6783,6 +6839,15 @@ function isRolloutTaskComplete(record: { payload?: Record<string, unknown>; type
   return record.type === "event_msg" && record.payload?.type === "task_complete";
 }
 
+function isRolloutUserMessageRecord(record: { payload?: Record<string, unknown>; type?: unknown }) {
+  return (
+    (record.type === "response_item" &&
+      record.payload?.type === "message" &&
+      record.payload.role === "user") ||
+    (record.type === "event_msg" && record.payload?.type === "user_message")
+  );
+}
+
 type RolloutPatchChange = {
   callId?: string;
   kind: string;
@@ -6823,6 +6888,7 @@ function rolloutRecordMessage(
       createdAt: timestamp,
       state: "completed",
       turnId,
+      phase: role === "assistant" ? rolloutMessagePhase(payload) : undefined,
     });
   }
 
@@ -6858,6 +6924,7 @@ function rolloutRecordMessage(
       createdAt: timestamp,
       state: "completed",
       turnId,
+      phase: rolloutMessagePhase(payload),
     });
   }
 
@@ -6928,6 +6995,11 @@ function rolloutRecordMessage(
   }
 
   return undefined;
+}
+
+function rolloutMessagePhase(payload: Record<string, unknown>) {
+  const phase = firstString(payload, ["phase"]);
+  return phase === "commentary" || phase === "final_answer" ? phase : undefined;
 }
 
 function rolloutResponseItemMessageContent(
@@ -7337,6 +7409,7 @@ function mapAppServerItem(threadId: string, turn: AppServerTurn, item: AppServer
         kind: planContent ? "plan" : undefined,
         content: planContent ?? messageParts.content,
         details: planContent ? { raw: agentItem.text } : messageParts.details,
+        phase: agentItem.phase ?? undefined,
       });
     }
     case "reasoning": {

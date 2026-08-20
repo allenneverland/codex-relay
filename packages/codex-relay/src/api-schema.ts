@@ -307,6 +307,8 @@ export const PendingInputRequestSchema = z.object({
   turnId: z.string().optional(),
 });
 
+export const ChatMessagePhaseSchema = z.enum(["commentary", "final_answer"]);
+
 export const ChatMessageSchema = z.object({
   id: z.string().min(1),
   threadId: z.string().min(1),
@@ -318,6 +320,7 @@ export const ChatMessageSchema = z.object({
   updatedAt: IsoDateTimeSchema.optional(),
   turnId: z.string().optional(),
   state: ChatMessageStateSchema.optional(),
+  phase: ChatMessagePhaseSchema.optional(),
 });
 
 export const ThreadSummarySchema = z.object({
@@ -786,6 +789,7 @@ export type ThreadState = z.infer<typeof ThreadStateSchema>;
 export type ChatMessageRole = z.infer<typeof ChatMessageRoleSchema>;
 export type ChatMessageState = z.infer<typeof ChatMessageStateSchema>;
 export type ChatMessageKind = z.infer<typeof ChatMessageKindSchema>;
+export type ChatMessagePhase = z.infer<typeof ChatMessagePhaseSchema>;
 export type ApprovalMode = z.infer<typeof ApprovalModeSchema>;
 export type KnownReasoningEffort = z.infer<typeof KnownReasoningEffortSchema>;
 export type ReasoningEffort = z.infer<typeof ReasoningEffortSchema>;
